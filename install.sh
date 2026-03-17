@@ -20,11 +20,13 @@ case "$(uname -s)" in
     SLIP_DIR="/usr/bin"
     APP_DEST="$BIN_DIR/chat-over-dnstt"
     SLIP_DEST="$SLIP_DIR/slipstream-client"
+    SLIP_CANDIDATES=("slipstream-client-linux-x86_64" "slipstream-client")
     ;;
   Darwin)
     BIN_DIR="/usr/local/bin"
     APP_DEST="/Applications/chat-over-dnstt"
     SLIP_DEST="$BIN_DIR/slipstream-client"
+    SLIP_CANDIDATES=("slipstream-client-macos-arm64" "slipstream-client")
     ;;
   *)
     echo "Unsupported OS: $(uname -s)"
@@ -54,13 +56,21 @@ chmod +x "$APP_DEST"
 echo "Installed: $APP_DEST"
 
 # Install slipstream-client if present
-if [[ -f "slipstream-client" ]]; then
-  chmod +x slipstream-client
-  cp -f slipstream-client "$SLIP_DEST"
+SLIP_EXE=""
+for name in "${SLIP_CANDIDATES[@]}"; do
+  if [[ -f "$name" ]]; then
+    SLIP_EXE="$name"
+    break
+  fi
+done
+
+if [[ -n "$SLIP_EXE" ]]; then
+  chmod +x "$SLIP_EXE"
+  cp -f "$SLIP_EXE" "$SLIP_DEST"
   chmod +x "$SLIP_DEST"
   echo "Installed: $SLIP_DEST"
 else
-  echo "slipstream-client not found in $SCRIPT_DIR (optional, skipped)"
+  echo "No platform-matching slipstream-client found in $SCRIPT_DIR (optional, skipped)"
 fi
 
 echo "Done. Run: $APP_DEST"
