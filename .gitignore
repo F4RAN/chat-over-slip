@@ -1,0 +1,8 @@
+.launcher_state.json
+.pyinstaller-*/
+.venv/
+.venv-build-*/
+__pycache__/
+dist/
+downloads/
+build/chat_over_dnstt/

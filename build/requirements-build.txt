@@ -1,0 +1,2 @@
+pyinstaller
+textual>=0.40.0
