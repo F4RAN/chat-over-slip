@@ -32,6 +32,19 @@ from chat_tui.app import ChatTransport, ChatView
 
 SLIPSTREAM_START_DELAY = 0.5
 
+SYSTEM_SLIPSTREAM_PATHS = [
+    Path("/usr/local/bin/slipstream-client"),
+    Path("/usr/bin/slipstream-client"),
+]
+
+
+def _system_slipstream_client() -> Optional[Path]:
+    """Return path to system-installed slipstream-client if present."""
+    for p in SYSTEM_SLIPSTREAM_PATHS:
+        if p.exists():
+            return p
+    return None
+
 
 class FilePickerScreen(ModalScreen):
     """Modal file browser to select a DNS result file."""
@@ -150,6 +163,10 @@ class DNSTTScreen(Static):
         self.dns_path_input.value = self.initial_state.get("dns_file_path", self.dns_file)
         self.dns_extra.value = self.initial_state.get("dns_extra", "")
         self._load_dns()
+        system_client = _system_slipstream_client()
+        if system_client:
+            self.slip_path.disabled = True
+            self.slip_path.value = f"Using {system_client}"
 
     def _load_dns(self):
         path = Path(self.dns_path_input.value.strip()).expanduser()
@@ -194,8 +211,12 @@ class DNSTTScreen(Static):
         return ips
 
     def get_values(self):
+        if self.slip_path.disabled:
+            slip_path = Path.home()
+        else:
+            slip_path = Path(self.slip_path.value.strip()).expanduser()
         return {
-            "slip_path": Path(self.slip_path.value.strip()).expanduser(),
+            "slip_path": slip_path,
             "domain": self.domain.value.strip() or "t.qtn.at",
             "user": self.user_input.value.strip(),
             "password": self.pass_input.value.strip(),
@@ -240,16 +261,23 @@ class ChatSessionScreen(Screen):
     async def _start_dns_clients(self) -> None:
         slip_path = Path(self.config["slip_path"])
         domain = self.config["domain"]
+        release_client = slip_path / "target" / "release" / "slipstream-client"
+        debug_client = slip_path / "target" / "debug" / "slipstream-client"
+        system_client = _system_slipstream_client()
+        if release_client.exists():
+            slip_cmd_prefix = [str(release_client)]
+        elif debug_client.exists():
+            slip_cmd_prefix = [str(debug_client)]
+        elif system_client:
+            slip_cmd_prefix = [str(system_client)]
+        else:
+            slip_cmd_prefix = ["cargo", "run", "-p", "slipstream-client", "--"]
         for ip, port in zip(self.config["dns_ips"], self.config["proxy_ports"]):
             if self.chat_view:
                 self.chat_view.write_system(f"Starting slipstream: {ip} -> 127.0.0.1:{port}")
             proc = subprocess.Popen(
-                [
-                    "cargo",
-                    "run",
-                    "-p",
-                    "slipstream-client",
-                    "--",
+                slip_cmd_prefix
+                + [
                     "--tcp-listen-port",
                     str(port),
                     "--resolver",
@@ -390,7 +418,7 @@ class LauncherApp(App):
         if not v["ips"]:
             self.notify("Select at least one DNS IP", severity="error")
             return
-        if not v["slip_path"] or not v["slip_path"].exists():
+        if not self.dns_screen.slip_path.disabled and (not v["slip_path"] or not v["slip_path"].exists()):
             self.notify("Slipstream path must exist", severity="error")
             return
         if self.state_path:

@@ -92,6 +92,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
@@ -110,3 +113,4 @@ jobs:
           files: |
             release-assets/chat-over-dnstt-linux-x86_64
             release-assets/chat-over-dnstt-macos-arm64
+            install.sh
