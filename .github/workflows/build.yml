@@ -124,6 +124,11 @@ jobs:
           name: slipstream-client-macos-arm64
           path: release-assets
 
+      - name: Create release zip
+        run: |
+          cp install.sh release-assets/
+          cd release-assets && zip -r "../chat-over-dnstt-${{ github.ref_name }}.zip" . && cd ..
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -132,3 +137,4 @@ jobs:
             release-assets/chat-over-dnstt-macos-arm64
             release-assets/slipstream-client-macos-arm64
             install.sh
+            chat-over-dnstt-${{ github.ref_name }}.zip
