@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import html
 import shutil
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QProgressBar,
@@ -65,6 +68,30 @@ from chat_common.session import (
     save_secure_password,
 )
 from chat_common.transport import ChatTransport, STATUS_POLL_INTERVAL
+
+CRASH_LOG_PATH = Path.home() / ".chat-over-dnstt" / "crash.log"
+
+
+def _setup_crash_logging() -> None:
+    """Enable faulthandler (SIGSEGV/SIGABRT tracebacks) and excepthook logging."""
+    log_dir = CRASH_LOG_PATH.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        f = open(CRASH_LOG_PATH, "a", encoding="utf-8")
+        f.write(f"\n--- {datetime.now().isoformat()} --- App start ---\n")
+        f.flush()
+        faulthandler.enable(file=f, all_threads=True)
+        _orig_excepthook = sys.excepthook
+
+        def _excepthook(etype, value, tb):
+            f.write(f"\n--- {datetime.now().isoformat()} --- Uncaught exception ---\n")
+            traceback.print_exception(etype, value, tb, file=f)
+            f.flush()
+            _orig_excepthook(etype, value, tb)
+
+        sys.excepthook = _excepthook
+    except Exception:
+        faulthandler.enable(all_threads=True)
 
 APP_STATE_ROOT = (
     Path(sys.executable).resolve().parent
@@ -273,15 +300,32 @@ class MessageBubble(QFrame):
 
 
 class MessageRow(QWidget):
-    def __init__(self, bubble: MessageBubble, align_right: bool):
+    def __init__(
+        self,
+        bubble: MessageBubble,
+        align_right: bool,
+        message=None,
+        on_delete: Optional[Callable[[], None]] = None,
+    ):
         super().__init__()
         self._bubble = bubble
+        self._message = message
+        self._on_delete = on_delete
         self.setLayoutDirection(Qt.RightToLeft if align_right else Qt.LeftToRight)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(0)
         layout.addWidget(bubble, 0, Qt.AlignTop)
         layout.addStretch(1)
+        if on_delete is not None:
+            self.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def _show_context_menu(self, pos):
+        ctx = QMenu(self)
+        action = ctx.addAction("Delete")
+        action.triggered.connect(self._on_delete)
+        ctx.exec(self.mapToGlobal(pos))
 
     def computed_height(self, available_width: int) -> int:
         return self._bubble.computed_height(available_width) + 10
@@ -365,6 +409,7 @@ class ChatWindow(QMainWindow):
         self._is_shutting_down = False
         self._message_filter_mode = "all"
         self._last_render_messages = []
+        self._hidden_messages: set = set()
         self.setWindowTitle(f"Chat over DNSTT - {self.session.display_name}")
         self.resize(1150, 760)
         self.setAcceptDrops(True)
@@ -644,6 +689,11 @@ class ChatWindow(QMainWindow):
         self.filter_messages_btn.setChecked(mode == "messages")
         self._render_messages(self._last_render_messages)
 
+    def _message_hide_key(self, message) -> Tuple:
+        if message.msg_id:
+            return ("id", message.msg_id)
+        return ("fp", message.timestamp, message.user, message.display_text)
+
     def _filtered_messages(self, messages) -> List:
         if self._message_filter_mode == "all":
             return list(messages)
@@ -665,6 +715,7 @@ class ChatWindow(QMainWindow):
         self._rendering = True
         self._last_render_messages = list(messages)
         messages = self._filtered_messages(messages)
+        messages = [m for m in messages if self._message_hide_key(m) not in self._hidden_messages]
         self._clear_chat_widgets()
         last_date: Optional[str] = None
         for message in messages:
@@ -698,7 +749,20 @@ class ChatWindow(QMainWindow):
                     link_handler=self._on_message_link,
                     body_is_html=body_is_html,
                 )
-            row = MessageRow(bubble, align_right=(message.own or message.rtl) and not message.system)
+            row_ref: List[Optional[QWidget]] = [None]
+
+            def make_on_delete():
+                def do_delete():
+                    self._on_delete_message(message, row_ref[0])
+                return do_delete
+
+            row = MessageRow(
+                bubble,
+                align_right=(message.own or message.rtl) and not message.system,
+                message=message,
+                on_delete=make_on_delete(),
+            )
+            row_ref[0] = row
             self._add_chat_widget(row)
         self._rendering = False
         self._scroll_to_bottom()
@@ -730,6 +794,13 @@ class ChatWindow(QMainWindow):
         if when is None:
             return fallback
         return when.strftime("%H:%M")
+
+    def _on_delete_message(self, message, row: QWidget) -> None:
+        if row is None or self._is_shutting_down:
+            return
+        self._hidden_messages.add(self._message_hide_key(message))
+        self.chat_layout.removeWidget(row)
+        row.deleteLater()
 
     def _on_message_link(self, value: str) -> None:
         if value.startswith("download:"):
@@ -1486,6 +1557,7 @@ class LauncherWindow(QMainWindow):
 
 
 def main() -> None:
+    _setup_crash_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--dns-file", default="", help="Path to DNS result file")
     args = parser.parse_args()
