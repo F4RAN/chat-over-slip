@@ -3,6 +3,8 @@
 .venv/
 .venv-build-*/
 __pycache__/
+.DS_Store
 dist/
 downloads/
 build/chat_over_dnstt/
+build/chat_over_dnstt_tui/

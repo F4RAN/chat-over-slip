@@ -7,19 +7,16 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_root = Path(SPECPATH).parent
 
-hiddenimports = collect_submodules("PySide6")
-hiddenimports += ["desktop_ui.app", "chat_common.transport", "chat_common.session"]
-hiddenimports += collect_submodules("keyring")
-hiddenimports += ["importlib"]
+hiddenimports = collect_submodules("textual")
+hiddenimports += collect_submodules("rich")
+hiddenimports += ["chat_tui.app", "launcher.app"]
 
-datas = collect_data_files("PySide6")
-assets_dir = project_root / "assets"
-if assets_dir.exists():
-    datas += [(str(assets_dir), "assets")]
+datas = collect_data_files("textual")
+datas += collect_data_files("rich")
 
 
 a = Analysis(
-    [str(project_root / "desktop_ui" / "app.py")],
+    [str(project_root / "launcher" / "app.py")],
     pathex=[str(project_root)],
     binaries=[],
     datas=datas,
@@ -38,12 +35,12 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="chat-over-dnstt",
+    name="chat-over-dnstt-tui",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=True,
 )

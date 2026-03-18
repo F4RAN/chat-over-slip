@@ -1,37 +1,20 @@
-"""Simple chat TUI backed by SSH commands."""
+"""Transport and file-transfer services shared by desktop frontends."""
+
 from __future__ import annotations
 
-import argparse
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime
 import os
 import pty
 import re
 import select
 import shlex
-import shutil
 import subprocess
 import sys
 import threading
 import time
-from urllib.parse import unquote, urlparse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-
-from rich import box
-from rich.align import Align
-from rich.console import Group
-from rich.markup import escape
-from rich.panel import Panel
-from rich.text import Text
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Container, Horizontal, VerticalScroll
-from textual import events
-from textual.widgets import Footer, Header, Input, RichLog, Static
 
 # Tunable parameters for poor or unstable networks.
 SSH_CONNECT_TIMEOUT = 45
@@ -51,14 +34,11 @@ APP_RUNTIME_ROOT = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent.parent
 )
-APP_RESOURCE_ROOT = (
-    Path(getattr(sys, "_MEIPASS")).resolve()
-    if getattr(sys, "frozen", False)
-    else Path(__file__).resolve().parent.parent
-)
 
 
 class ChatTransport:
+    """Client-side bridge to the remote ``chat.sh`` protocol."""
+
     def __init__(
         self,
         mode: str,
@@ -340,7 +320,6 @@ class ChatTransport:
         )
 
         if self.mode == "ssh":
-            last_exc = None
             last_proc = None
             for attempt in range(SSH_SEND_RETRIES):
                 try:
@@ -349,7 +328,6 @@ class ChatTransport:
                     )
                     break
                 except Exception as exc:
-                    last_exc = exc
                     self.last_error = str(exc)
                     if attempt < SSH_SEND_RETRIES - 1:
                         time.sleep(SSH_SEND_RETRY_DELAY)
@@ -445,6 +423,46 @@ class ChatTransport:
 
         self.last_error = "; ".join(errors)
         return False, self.last_error or "news fetch failed", dict(self.status)
+
+    def touch_presence(self, name: str) -> None:
+        remote_command = f"bash {self.remote_script} -u {shlex.quote(name)}"
+        if self.mode == "ssh":
+            try:
+                self._remote_run(remote_command, timeout=REMOTE_COMMAND_TIMEOUT)
+            except Exception:
+                return
+            return
+        for ip, port in zip(self.dns_ips, self.proxy_ports):
+            try:
+                proc = self._remote_run(remote_command, proxy_port=port, timeout=REMOTE_COMMAND_TIMEOUT)
+            except Exception:
+                continue
+            if proc.returncode == 0:
+                return
+
+    def fetch_online_users(self, window_seconds: int = 90) -> List[str]:
+        remote_command = f"bash {self.remote_script} -w {int(window_seconds)}"
+        if self.mode == "ssh":
+            try:
+                proc = self._remote_run(remote_command, timeout=REMOTE_COMMAND_TIMEOUT)
+            except Exception:
+                return []
+            if proc.returncode != 0:
+                return []
+            return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+        ordered_links = sorted(
+            zip(self.dns_ips, self.proxy_ports),
+            key=lambda item: {"ok": 0, "unknown": 1, "fail": 2}.get(self.status.get(item[0], "unknown"), 1),
+        )
+        for ip, port in ordered_links:
+            try:
+                proc = self._remote_run(remote_command, proxy_port=port, timeout=REMOTE_COMMAND_TIMEOUT)
+            except Exception:
+                continue
+            if proc.returncode == 0:
+                return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        return []
 
     def upload_file(
         self,
@@ -596,521 +614,3 @@ class ChatTransport:
         self.last_error = "; ".join(errors) or "download failed"
         return False, self.last_error, dict(self.status)
 
-
-class StatusPanel(Static):
-    def _overall_state(self, statuses: Dict[str, str]) -> Tuple[str, str]:
-        values = list(statuses.values())
-        if any(state == "ok" for state in values):
-            return "online", "green"
-        if any(state == "unknown" for state in values):
-            return "waiting", "yellow"
-        return "offline", "red"
-
-    def render_status(self, mode: str, statuses: Dict[str, str], last_error: str = "") -> None:
-        lines = [f"[bold]Mode[/]: {mode}"]
-        if not statuses:
-            lines += ["", "[dim]No link status yet[/]"]
-        else:
-            overall, color = self._overall_state(statuses)
-            lines += ["", f"[bold]State[/]: [{color}]{overall}[/{color}]"]
-            lines += ["", "[bold]Links[/]"]
-            for label, state in statuses.items():
-                color = "yellow" if state == "unknown" else ("green" if state == "ok" else "red")
-                lines.append(f"[{color}]{label}: {state}[/{color}]")
-        if last_error:
-            lines += ["", "[bold]Last Error[/]", f"[red]{last_error}[/red]"]
-        self.update("\n".join(lines))
-
-
-class UploadInput(Input):
-    def _extract_file_path(self, text: str) -> Optional[str]:
-        line = text.strip()
-        if not line:
-            return None
-
-        if line.startswith("file://"):
-            parsed = urlparse(line)
-            candidate = unquote(parsed.path)
-            if candidate and Path(candidate).expanduser().is_file():
-                return candidate
-
-        try:
-            parts = shlex.split(line)
-        except ValueError:
-            parts = [line]
-
-        if len(parts) != 1:
-            return None
-
-        candidate = str(Path(parts[0]).expanduser())
-        if Path(candidate).is_file():
-            return candidate
-        return None
-
-    def as_upload_command(self, text: str) -> Optional[str]:
-        file_path = self._extract_file_path(text)
-        if not file_path:
-            return None
-        return f"/upload {file_path}"
-
-    def _on_paste(self, event: events.Paste) -> None:
-        upload_command = self.as_upload_command(event.text)
-        if upload_command:
-            self.value = upload_command
-            self.post_message(self.Submitted(self, self.value, None))
-            event.stop()
-            return
-        super()._on_paste(event)
-
-
-class ChatView(Static):
-    DEFAULT_CSS = """
-    ChatView {
-        height: 1fr;
-        width: 100%;
-        layout: vertical;
-    }
-    #main {
-        height: 1fr;
-        layout: horizontal;
-    }
-    #chat-area {
-        width: 1fr;
-        height: 1fr;
-        padding: 1 2;
-        border: solid $primary;
-    }
-    #status {
-        width: 28;
-        height: 1fr;
-        padding: 1;
-        border: solid $primary;
-        background: $surface-darken-1;
-    }
-    #input-area {
-        height: auto;
-        layout: vertical;
-        padding: 1 2;
-        border: solid $primary;
-    }
-    #transfer-status {
-        height: auto;
-        min-height: 1;
-        padding: 0 0 1 0;
-    }
-    """
-
-    def __init__(self, transport: ChatTransport, display_name: str, startup_lines: Optional[List[str]] = None):
-        super().__init__()
-        self.transport = transport
-        self.display_name = display_name or os.environ.get("USER", "anon")
-        self.startup_lines = startup_lines or []
-        self.last_snapshot = ""
-        self.poll_task: Optional[asyncio.Task] = None
-        self.pending_messages: List[Tuple[str, str]] = []
-        self.upload_status: Dict[str, str] = {}
-        self.available_files: Dict[str, str] = {}
-        self.seen_msg_ids: set = set()
-
-    def _has_rtl(self, text: str) -> bool:
-        for c in (text or ""):
-            if "\u0590" <= c <= "\u08FF" or "\uFB50" <= c <= "\uFDFF" or "\uFE70" <= c <= "\uFEFF":
-                return True
-        return False
-
-    def _rtl_wrap(self, text: str) -> str:
-        if not text or not self._has_rtl(text):
-            return text
-        return "\u2067" + text + "\u2069"
-
-    def _play_notification_sound(self) -> None:
-        def _run() -> None:
-            try:
-                if sys.platform == "darwin":
-                    subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], timeout=1, capture_output=True, check=False)
-                elif shutil.which("paplay"):
-                    subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"], timeout=1, capture_output=True, check=False)
-                elif shutil.which("aplay"):
-                    subprocess.run(["aplay", "-q", "/usr/share/sounds/alsa/Front_Center.wav"], timeout=1, capture_output=True, check=False)
-                else:
-                    sys.stdout.write("\a")
-                    sys.stdout.flush()
-            except Exception:
-                pass
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _append_local_line(self, user: str, text: str, pending: bool = False) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        suffix = " [yellow](pending)[/yellow]" if pending else ""
-        display_text, _ = self._parse_file_message(text)
-        body = self._rtl_wrap(display_text) + suffix
-        header = f"[dim]{now}[/] [bold]{user}[/]"
-        self.chat_area.write(Panel(Group(Text.from_markup(header), Text.from_markup(body)), padding=(0, 1), border_style="dim", box=box.ROUNDED))
-
-    def write_system(self, text: str, style: str = "dim") -> None:
-        self.chat_area.write(f"[{style}]{text}[/{style}]")
-
-    def _parse_file_message(self, text: str) -> Tuple[str, Optional[Tuple[str, str]]]:
-        file_match = re.match(r"^\[file\]\s+(.+?)::(.+)$", text)
-        if file_match:
-            name, relative_path = file_match.groups()
-            return (
-                f"[file] [u cyan]{escape(name)}[/u cyan] [dim](/download {escape(name)})[/dim]",
-                (name, relative_path),
-            )
-
-        tg_match = re.match(r"^\[TG file\]\s+(.+?)\s+saved to\s+(.+)$", text)
-        if tg_match:
-            name, saved_name = tg_match.groups()
-            return (
-                f"[file] [u cyan]{escape(name)}[/u cyan] [dim](/download {escape(name)})[/dim]",
-                (name, f"tg_files/{saved_name}"),
-            )
-
-        return text, None
-
-    def compose(self) -> ComposeResult:
-        with Container(id="main"):
-            yield RichLog(id="chat-area", wrap=True, markup=True)
-            yield StatusPanel(id="status")
-        with Container(id="input-area"):
-            yield Static("", id="transfer-status")
-            yield UploadInput(placeholder="Type message. Commands: /clear /upload /download /news", id="msg-input")
-
-    def on_mount(self) -> None:
-        self.chat_area = self.query_one("#chat-area", RichLog)
-        self.status_panel = self.query_one("#status", StatusPanel)
-        self.transfer_status = self.query_one("#transfer-status", Static)
-        self.input_w = self.query_one("#msg-input", Input)
-        for line in self.startup_lines:
-            self.write_system(line)
-        self.status_panel.render_status(self.transport.mode.upper(), self.transport.status, self.transport.last_error)
-        asyncio.create_task(self.refresh_now())
-        self.poll_task = asyncio.create_task(self._poll_loop())
-
-    async def refresh_now(self) -> None:
-        try:
-            snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-            self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-            if snapshot is not None:
-                self.last_snapshot = snapshot
-                self._render_snapshot(snapshot)
-        except Exception as exc:
-            self.transport.last_error = str(exc)
-            self.status_panel.render_status(self.transport.mode.upper(), self.transport.status, self.transport.last_error)
-
-    async def _poll_loop(self) -> None:
-        while True:
-            try:
-                snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-                self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-                if snapshot is not None and snapshot != self.last_snapshot:
-                    self.last_snapshot = snapshot
-                    self._render_snapshot(snapshot)
-                # When SSH is back online, retry one pending message per poll
-                if (
-                    snapshot is not None
-                    and self.pending_messages
-                    and self.transport.mode == "ssh"
-                ):
-                    await self._retry_one_pending()
-            except Exception as exc:
-                self.transport.last_error = str(exc)
-                self.status_panel.render_status(self.transport.mode.upper(), self.transport.status, self.transport.last_error)
-            await asyncio.sleep(STATUS_POLL_INTERVAL)
-
-    def _render_snapshot(self, snapshot: str) -> None:
-        self.chat_area.clear()
-        available_files: Dict[str, str] = {}
-        had_previous = len(self.seen_msg_ids) > 0
-        should_play = False
-        for line in snapshot.splitlines():
-            if "|" in line:
-                parts = line.split("|", 3)
-                if len(parts) == 4:
-                    ts, msg_id, user, text = parts
-                    if msg_id not in self.seen_msg_ids and had_previous and user != self.display_name:
-                        should_play = True
-                    self.seen_msg_ids.add(msg_id)
-                    display_text, file_entry = self._parse_file_message(text)
-                    body = self._rtl_wrap(display_text)
-                    header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    self.chat_area.write(Panel(Group(Text.from_markup(header), Text.from_markup(body)), padding=(0, 1), border_style="dim", box=box.ROUNDED))
-                    if file_entry:
-                        name, relative_path = file_entry
-                        available_files[name] = relative_path
-                    continue
-            self.chat_area.write(line)
-        for user, text in self.pending_messages:
-            self._append_local_line(user, text, pending=True)
-        self.available_files = available_files
-        if should_play:
-            self._play_notification_sound()
-
-    def _resolve_download_target(self, query: str) -> Optional[Tuple[str, str]]:
-        query = query.strip()
-        if not query:
-            return None
-        if query in self.available_files:
-            return query, self.available_files[query]
-        for name, relative_path in self.available_files.items():
-            if relative_path == query or relative_path.endswith(query):
-                return name, relative_path
-        return None
-
-    def _render_upload_status(self) -> None:
-        if not self.upload_status:
-            self.transfer_status.update("")
-            return
-        percent_items = [(label, status) for label, status in self.upload_status.items() if status.endswith("%")]
-        if percent_items:
-            label, status = sorted(percent_items, key=lambda item: int(item[1][:-1]), reverse=True)[0]
-            self.transfer_status.update(f"[bold]Transfer[/]: {label} {status}")
-            return
-        selected_items = [(label, status) for label, status in self.upload_status.items() if status == "selected"]
-        if selected_items:
-            label, _status = selected_items[0]
-            self.transfer_status.update(f"[bold]Transfer[/]: {label} selected")
-            return
-        parts = [f"{label}: {status}" for label, status in sorted(self.upload_status.items())]
-        self.transfer_status.update("[bold]Transfer[/]: " + " | ".join(parts[:3]))
-
-    def _update_upload_status(self, label: str, percent: Optional[int], stage: str) -> None:
-        if stage == "done":
-            self.upload_status[label] = "100%"
-        elif stage == "selected":
-            self.upload_status[label] = "selected"
-        elif stage == "failed":
-            self.upload_status[label] = "failed"
-        elif stage == "preparing":
-            self.upload_status[label] = "preparing"
-        elif stage == "probing":
-            self.upload_status[label] = "probing"
-        elif percent is not None:
-            self.upload_status[label] = f"{percent}%"
-        else:
-            self.upload_status[label] = stage
-        self._render_upload_status()
-
-    def _clear_upload_status(self) -> None:
-        self.upload_status.clear()
-        self._render_upload_status()
-
-    async def _send_text(self, text: str) -> None:
-        self.pending_messages.append((self.display_name, text))
-        self._render_snapshot(self.last_snapshot)
-        asyncio.create_task(self._send_text_background(text))
-
-    async def _retry_one_pending(self) -> None:
-        """Send the oldest pending message once (SSH mode). Used when back online."""
-        if not self.pending_messages or self.transport.mode != "ssh":
-            return
-        user, text = self.pending_messages[0]
-        ok, err, statuses = await asyncio.to_thread(
-            self.transport.send_message, user, text
-        )
-        self.status_panel.render_status(
-            self.transport.mode.upper(), statuses, self.transport.last_error
-        )
-        if not ok:
-            return
-        try:
-            self.pending_messages.remove((user, text))
-        except ValueError:
-            pass
-        snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-        self.status_panel.render_status(
-            self.transport.mode.upper(), statuses, self.transport.last_error
-        )
-        if snapshot is not None:
-            self.last_snapshot = snapshot
-            self._render_snapshot(snapshot)
-        else:
-            self._render_snapshot(self.last_snapshot)
-
-    async def _send_text_background(self, text: str) -> None:
-        ok, err, statuses = await asyncio.to_thread(self.transport.send_message, self.display_name, text)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-        if not ok:
-            self.chat_area.write(f"[red]Send failed[/]: {err or 'no working link'}")
-            return
-        try:
-            self.pending_messages.remove((self.display_name, text))
-        except ValueError:
-            pass
-        snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-        if snapshot is not None:
-            self.last_snapshot = snapshot
-            self._render_snapshot(snapshot)
-        else:
-            self._render_snapshot(self.last_snapshot)
-
-    async def _clear_chat(self) -> None:
-        ok, err = await asyncio.to_thread(self.transport.clear_messages)
-        if ok:
-            self.last_snapshot = ""
-            self.seen_msg_ids.clear()
-            self.chat_area.clear()
-            self.chat_area.write("[yellow]Chat cleared[/]")
-        else:
-            self.chat_area.write(f"[red]Clear failed[/]: {err}")
-
-    async def _fetch_news(self, channel: str, range_spec: str) -> None:
-        self.chat_area.write(f"[yellow]Fetching news[/]: {channel} {range_spec}")
-        ok, result, statuses = await asyncio.to_thread(self.transport.fetch_news, channel, range_spec)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-        if not ok:
-            self.chat_area.write(f"[red]News failed[/]: {result}")
-            return
-        self.chat_area.write(f"[green]News imported[/]: {channel} {range_spec}")
-        await self.refresh_now()
-
-    async def _upload_file(self, path: str) -> None:
-        self.chat_area.write(f"[yellow]Uploading[/]: {path}")
-        self._clear_upload_status()
-
-        def progress_cb(label: str, percent: Optional[int], stage: str) -> None:
-            self.app.call_from_thread(self._update_upload_status, label, percent, stage)
-
-        ok, result, statuses = await asyncio.to_thread(self.transport.upload_file, path, progress_cb)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-        if not ok:
-            self._clear_upload_status()
-            self.chat_area.write(f"[red]Upload failed[/]: {result}")
-            return
-        self._clear_upload_status()
-        self.chat_area.write(f"[green]Upload complete[/]: {result}")
-        await self._send_text(f"[file] {result}::uploads/{result}")
-
-    async def _download_file(self, name: str, relative_path: str) -> None:
-        self.chat_area.write(f"[yellow]Downloading[/]: {name}")
-        self._clear_upload_status()
-
-        def progress_cb(label: str, percent: Optional[int], stage: str) -> None:
-            self.app.call_from_thread(self._update_upload_status, label, percent, stage)
-
-        ok, result, statuses = await asyncio.to_thread(self.transport.download_file, relative_path, progress_cb)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
-        self._clear_upload_status()
-        if not ok:
-            self.chat_area.write(f"[red]Download failed[/]: {result}")
-            return
-        self.chat_area.write(f"[green]Downloaded[/]: {name} -> {result}")
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        event.input.value = ""
-        if not text:
-            return
-        if isinstance(event.input, UploadInput) and not text.startswith("/upload "):
-            upload_command = event.input.as_upload_command(text)
-            if upload_command:
-                text = upload_command
-        if text == "/clear":
-            await self._clear_chat()
-            return
-        if text.startswith("/news "):
-            parts = text.split(maxsplit=2)
-            if len(parts) < 2:
-                self.chat_area.write("[red]News failed[/]: usage /news ChannelName 10 or /news ChannelName 20-10")
-                return
-            channel = parts[1].strip()
-            range_spec = parts[2].strip() if len(parts) > 2 else "10"
-            if not channel:
-                self.chat_area.write("[red]News failed[/]: channel name required")
-                return
-            await self._fetch_news(channel, range_spec)
-            return
-        if text.startswith("/upload "):
-            await self._upload_file(text.split(" ", 1)[1].strip())
-            return
-        if text.startswith("/download "):
-            target = self._resolve_download_target(text.split(" ", 1)[1].strip())
-            if not target:
-                self.chat_area.write("[red]Download failed[/]: file not found in recent messages")
-                return
-            name, relative_path = target
-            await self._download_file(name, relative_path)
-            return
-        await self._send_text(text)
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if not isinstance(event.input, UploadInput):
-            return
-        if event.value.startswith("/upload "):
-            return
-        upload_command = event.input.as_upload_command(event.value)
-        if upload_command and event.input.value != upload_command:
-            event.input.value = upload_command
-            event.input.cursor_position = len(upload_command)
-
-    def shutdown(self) -> None:
-        if self.poll_task:
-            self.poll_task.cancel()
-
-
-class ChatApp(App):
-    CSS = """
-    Screen {
-        layout: vertical;
-    }
-    """
-
-    BINDINGS = [Binding("q", "quit", "Quit")]
-
-    def __init__(self, transport: ChatTransport, display_name: str):
-        super().__init__()
-        self.transport = transport
-        self.display_name = display_name or os.environ.get("USER", "anon")
-        self.chat_view: Optional[ChatView] = None
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        self.chat_view = ChatView(self.transport, self.display_name)
-        yield self.chat_view
-        yield Footer()
-
-    def action_quit(self) -> None:
-        if self.chat_view:
-            self.chat_view.shutdown()
-        self.exit()
-
-    async def action_download_file(self, name: str, relative_path: str) -> None:
-        if self.chat_view:
-            await self.chat_view._download_file(name, relative_path)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["ssh", "dns"], required=True)
-    parser.add_argument("--host", default="")
-    parser.add_argument("--domain", default="")
-    parser.add_argument("--ssh-user", required=True)
-    parser.add_argument("--ssh-pass", required=True)
-    parser.add_argument("--remote-script", default="~/chat-over-dnstt/chat.sh")
-    parser.add_argument("--display-name", default="")
-    parser.add_argument("--proxy-ports", default="")
-    parser.add_argument("--dns-ips", default="")
-    args = parser.parse_args()
-
-    proxy_ports = [int(item.strip()) for item in args.proxy_ports.split(",") if item.strip()]
-    dns_ips = [item.strip() for item in args.dns_ips.split(",") if item.strip()]
-
-    transport = ChatTransport(
-        mode=args.mode,
-        host=args.host,
-        domain=args.domain,
-        ssh_user=args.ssh_user,
-        ssh_pass=args.ssh_pass,
-        remote_script=args.remote_script,
-        proxy_ports=proxy_ports,
-        dns_ips=dns_ips,
-    )
-    app = ChatApp(transport=transport, display_name=args.display_name or args.ssh_user)
-    app.run()
-
-
-if __name__ == "__main__":
-    main()

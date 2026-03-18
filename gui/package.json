@@ -1,0 +1,25 @@
+{
+  "name": "chat-over-dnstt-gui",
+  "version": "1.0.0",
+  "description": "Electron GUI for chat-over-dnstt",
+  "main": "main.js",
+  "build": {
+    "appId": "chat.over.dnstt",
+    "productName": "Chat over DNSTT",
+    "directories": { "output": "dist" },
+    "mac": { "category": "public.app-category.social", "target": ["dmg", "zip"] },
+    "linux": { "target": ["AppImage"] }
+  },
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  }
+}
