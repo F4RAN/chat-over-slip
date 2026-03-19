@@ -854,6 +854,7 @@ class ChatView(Static):
         startup_lines: Optional[List[str]] = None,
         scanner_input_file: str = "",
         on_new_dns_ip: Optional[Callable[[str, int], None]] = None,
+        on_restart_link: Optional[Callable[[str, int], None]] = None,
     ):
         super().__init__()
         self.transport = transport
@@ -872,6 +873,7 @@ class ChatView(Static):
         self._scan_finished_at: Optional[float] = None
         self._scan_timer = None
         self._on_new_dns_ip = on_new_dns_ip
+        self._on_restart_link = on_restart_link
         self._message_filter_mode = "all"
 
     def _has_rtl(self, text: str) -> bool:
@@ -1180,6 +1182,22 @@ class ChatView(Static):
             self.transport.last_error = str(exc)
             self._render_status_panel(self.transport.status)
 
+    def _restart_pending_links(self) -> None:
+        """Restart slipstream processes for DNS links that got 'unknown port 65535'."""
+        pending = self.transport.pop_pending_restarts()
+        if not pending or not self._on_restart_link:
+            return
+        for ip in pending:
+            if ip not in self.transport.dns_ips:
+                continue
+            idx = self.transport.dns_ips.index(ip)
+            port = self.transport.proxy_ports[idx]
+            retry = self.transport.retry_counts.get(ip, 0)
+            self.write_system(
+                f"[yellow]Retrying DNS link {ip} ({retry}/2)[/yellow]"
+            )
+            self._on_restart_link(ip, port)
+
     async def _poll_loop(self) -> None:
         while True:
             try:
@@ -1195,6 +1213,7 @@ class ChatView(Static):
                     and self.transport.mode == "ssh"
                 ):
                     await self._retry_one_pending()
+                self._restart_pending_links()
             except Exception as exc:
                 self.transport.last_error = str(exc)
                 self._render_status_panel(self.transport.status)
