@@ -28,6 +28,7 @@ SCP_PROGRESS_POLL_INTERVAL = 0.25
 STATUS_POLL_INTERVAL = 3
 SOFT_ERROR_OK_GRACE_FAILURES = 3
 SOFT_ERROR_UNKNOWN_GRACE_FAILURES = 2
+DNS_LINK_MAX_RETRIES = 2
 SSH_SEND_RETRIES = 3
 SSH_SEND_RETRY_DELAY = 2
 APP_RUNTIME_ROOT = (
@@ -63,10 +64,14 @@ class ChatTransport:
             self.status = {ip: "unknown" for ip in self.dns_ips}
             self.fail_counts = {ip: 0 for ip in self.dns_ips}
             self.last_online_at = {ip: None for ip in self.dns_ips}
+            self.retry_counts: Dict[str, int] = {ip: 0 for ip in self.dns_ips}
+            self._pending_restarts: List[str] = []
         else:
             self.status = {"ssh": "unknown"}
             self.fail_counts = {"ssh": 0}
             self.last_online_at = {"ssh": None}
+            self.retry_counts = {}
+            self._pending_restarts = []
         self.last_error = ""
 
     def _normalize_remote_script(self, path: str) -> str:
@@ -279,7 +284,11 @@ class ChatTransport:
             return
         self.status[label] = "ok"
         self.fail_counts[label] = 0
+        self.retry_counts[label] = 0
         self.last_online_at[label] = datetime.now(timezone.utc)
+
+    def _needs_restart(self, error: str) -> bool:
+        return "unknown port 65535" in (error or "").lower()
 
     def _mark_failure(self, label: str, error: str) -> None:
         if self._is_removed(label):
@@ -292,8 +301,20 @@ class ChatTransport:
                 self.status[label] = "unknown"
             else:
                 self.status[label] = "fail"
+        elif self._needs_restart(error) and self.retry_counts.get(label, 0) < DNS_LINK_MAX_RETRIES:
+            self.retry_counts[label] = self.retry_counts.get(label, 0) + 1
+            self.status[label] = "unknown"
+            self.fail_counts[label] = 0
+            if label not in self._pending_restarts:
+                self._pending_restarts.append(label)
         else:
             self.status[label] = "fail"
+
+    def pop_pending_restarts(self) -> List[str]:
+        """Return and clear list of DNS IPs that need their slipstream restarted."""
+        restarts = self._pending_restarts[:]
+        self._pending_restarts.clear()
+        return restarts
 
     def remove_dns_link(self, label: str) -> bool:
         """Remove one DNS link from runtime state (UI-only delete)."""

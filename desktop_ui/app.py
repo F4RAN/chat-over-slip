@@ -1036,6 +1036,43 @@ class ChatWindow(QMainWindow):
                 self._play_incoming_sound()
         if self.session.should_retry_pending(self.transport.mode, snapshot):
             self._retry_pending_once()
+        self._restart_pending_links()
+
+    def _restart_pending_links(self) -> None:
+        """Restart slipstream processes for DNS links that got 'unknown port 65535'."""
+        pending = self.transport.pop_pending_restarts()
+        if not pending or not self.slipstream_manager:
+            return
+        for ip in pending:
+            if ip not in self.transport.dns_ips:
+                continue
+            idx = self.transport.dns_ips.index(ip)
+            if idx >= len(self.slipstream_manager.processes):
+                continue
+            port = self.transport.proxy_ports[idx]
+            old_proc = self.slipstream_manager.processes[idx]
+            log.info("Restarting slipstream for %s (port %d), retry %d/%d",
+                     ip, port, self.transport.retry_counts.get(ip, 0), 2)
+            old_proc.terminate()
+            try:
+                old_proc.wait(timeout=3)
+            except Exception:
+                old_proc.kill()
+            self.slipstream_manager._free_port(port)
+            new_proc = subprocess.Popen(
+                [
+                    "/usr/local/bin/slipstream-client",
+                    "--tcp-listen-port", str(port),
+                    "--resolver", f"{ip}:53",
+                    "--domain", self.transport.domain,
+                ],
+                cwd=str(self.slipstream_manager.slip_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.slipstream_manager.processes[idx] = new_proc
+            self._append_system_message(f"Retrying DNS link {ip} ({self.transport.retry_counts.get(ip, 0)}/2)")
 
     def _start_online_refresh_cycle(self) -> None:
         if self._is_shutting_down:
