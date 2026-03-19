@@ -288,7 +288,7 @@ class ChatTransport:
         self.last_online_at[label] = datetime.now(timezone.utc)
 
     def _needs_restart(self, error: str) -> bool:
-        return "unknown port 65535" in (error or "").lower()
+        return "connection closed by unknown port 65535" in (error or "").lower()
 
     def _mark_failure(self, label: str, error: str) -> None:
         if self._is_removed(label):

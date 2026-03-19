@@ -295,7 +295,7 @@ class ChatTransport:
                     pass
 
     def _needs_restart(self, error: str) -> bool:
-        return "unknown port 65535" in (error or "").lower()
+        return "connection closed by unknown port 65535" in (error or "").lower()
 
     def _mark_success(self, label: str) -> None:
         self.status[label] = "ok"
