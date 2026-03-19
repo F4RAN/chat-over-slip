@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlparse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from rich import box
 from rich.console import Group
@@ -89,6 +89,7 @@ class ChatTransport:
             self.last_online_at = {"ssh": None}
         self.retry_counts: Dict[str, int] = {}
         self._pending_restarts: List[str] = []
+        self.ready_ips: Set[str] = set()
         self.last_error = ""
 
     def _normalize_remote_script(self, path: str) -> str:
@@ -372,10 +373,16 @@ class ChatTransport:
 
         first_output = None
         remote_command = f"bash {self.remote_script} -r {limit}"
-        with ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports))) as executor:
+        active = [
+            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
+            if ip in self.ready_ips
+        ]
+        if not active:
+            return None, dict(self.status)
+        with ThreadPoolExecutor(max_workers=max(1, len(active))) as executor:
             futures = [
                 executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-                for ip, port in zip(self.dns_ips, self.proxy_ports)
+                for ip, port in active
             ]
             for future in as_completed(futures):
                 ip, state, output, error = future.result()
@@ -424,10 +431,16 @@ class ChatTransport:
 
         successes = 0
         errors = []
-        executor = ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports)))
+        active = [
+            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
+            if ip in self.ready_ips
+        ]
+        if not active:
+            return False, "no ready links", dict(self.status)
+        executor = ThreadPoolExecutor(max_workers=max(1, len(active)))
         futures = [
             executor.submit(self._run_link_command, ip, port, remote_command, None)
-            for ip, port in zip(self.dns_ips, self.proxy_ports)
+            for ip, port in active
         ]
         try:
             for future in as_completed(futures):
@@ -453,10 +466,16 @@ class ChatTransport:
             return proc.returncode == 0, proc.stderr.strip()
 
         errors = []
-        with ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports))) as executor:
+        active = [
+            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
+            if ip in self.ready_ips
+        ]
+        if not active:
+            return False, "no ready links"
+        with ThreadPoolExecutor(max_workers=max(1, len(active))) as executor:
             futures = [
                 executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-                for ip, port in zip(self.dns_ips, self.proxy_ports)
+                for ip, port in active
             ]
             for future in as_completed(futures):
                 ip, state, _output, error = future.result()
@@ -489,9 +508,11 @@ class ChatTransport:
             return False, err, dict(self.status)
 
         ordered_links = sorted(
-            zip(self.dns_ips, self.proxy_ports),
+            [(ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports) if ip in self.ready_ips],
             key=lambda item: {"ok": 0, "unknown": 1, "fail": 2}.get(self.status.get(item[0], "unknown"), 1),
         )
+        if not ordered_links:
+            return False, "no ready links", dict(self.status)
         errors = []
         for ip, port in ordered_links:
             link_ip, state, output, error = self._run_link_command(ip, port, remote_command, NEWS_COMMAND_TIMEOUT)
@@ -534,14 +555,20 @@ class ChatTransport:
 
         errors = []
         chosen_link: Optional[Tuple[str, int]] = None
+        active = [
+            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
+            if ip in self.ready_ips
+        ]
+        if not active:
+            return False, "no ready links", dict(self.status)
         if progress_cb:
-            for ip in self.dns_ips:
+            for ip, _port in active:
                 progress_cb(ip, 0, "probing")
 
-        with ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports))) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, len(active))) as executor:
             futures = [
                 executor.submit(self._run_link_command, ip, port, mkdir_cmd, REMOTE_COMMAND_TIMEOUT)
-                for ip, port in zip(self.dns_ips, self.proxy_ports)
+                for ip, port in active
             ]
             for future in as_completed(futures):
                 ip, state, _output, error = future.result()
@@ -608,14 +635,20 @@ class ChatTransport:
 
         errors = []
         chosen_link: Optional[Tuple[str, int]] = None
+        active = [
+            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
+            if ip in self.ready_ips
+        ]
+        if not active:
+            return False, "no ready links", dict(self.status)
         if progress_cb:
-            for ip in self.dns_ips:
+            for ip, _port in active:
                 progress_cb(ip, 0, "probing")
 
-        with ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports))) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, len(active))) as executor:
             futures = [
                 executor.submit(self._run_link_command, ip, port, check_cmd, REMOTE_COMMAND_TIMEOUT)
-                for ip, port in zip(self.dns_ips, self.proxy_ports)
+                for ip, port in active
             ]
             for future in as_completed(futures):
                 ip, state, _output, error = future.result()

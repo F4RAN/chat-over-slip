@@ -413,6 +413,7 @@ class ChatSessionScreen(Screen):
                 start_new_session=True,
             )
             self.slip_procs.append(proc)
+            self.chat_view.transport.ready_ips.add(ip)
             await asyncio.sleep(SLIPSTREAM_START_DELAY)
         if self.chat_view:
             self.chat_view.write_system("Slipstream clients started. Waiting for links...")
