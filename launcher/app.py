@@ -308,6 +308,29 @@ class ChatSessionScreen(Screen):
         self.slip_procs = []
         self.chat_view: Optional[ChatView] = None
 
+    def _on_new_dns_ip(self, ip: str, port: int) -> None:
+        if self.config["mode"] != "dns":
+            return
+        slip_path = Path(self.config.get("slip_path", ""))
+        domain = self.config.get("domain", "")
+        if not slip_path.exists():
+            return
+        if self.chat_view:
+            self.chat_view.write_system(f"Starting slipstream: {ip} -> 127.0.0.1:{port}")
+        proc = subprocess.Popen(
+            [
+                "/usr/local/bin/slipstream-client",
+                "--tcp-listen-port", str(port),
+                "--resolver", f"{ip}:53",
+                "--domain", domain,
+            ],
+            cwd=str(slip_path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.slip_procs.append(proc)
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         transport = ChatTransport(
@@ -320,7 +343,13 @@ class ChatSessionScreen(Screen):
             proxy_ports=self.config.get("proxy_ports", []),
             dns_ips=self.config.get("dns_ips", []),
         )
-        self.chat_view = ChatView(transport, self.config.get("name") or self.config["user"], self.startup_lines)
+        self.chat_view = ChatView(
+            transport,
+            self.config.get("name") or self.config["user"],
+            self.startup_lines,
+            scanner_input_file=self.config.get("scanner_input_file", ""),
+            on_new_dns_ip=self._on_new_dns_ip,
+        )
         yield self.chat_view
         yield Footer()
 
@@ -495,6 +524,7 @@ class LauncherApp(App):
                     "remote_script": v["remote_script"],
                     "dns_ips": v["ips"],
                     "proxy_ports": [base_port + index for index in range(len(v["ips"]))],
+                    "scanner_input_file": v.get("scanner_input_file", ""),
                 },
                 startup_lines=[
                     "Preparing DNSTT chat session...",

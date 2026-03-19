@@ -458,6 +458,10 @@ class ChatWindow(QMainWindow):
         self._last_render_messages = []
         self._hidden_messages: set = set()
         self._active_worker: Optional[FunctionWorker] = None
+        self._scanner_proc: Optional[subprocess.Popen] = None
+        self._scanner_output_path = APP_STATE_ROOT / "chat-scanner-result.txt"
+        self._scanner_known_ips: set = set()
+        self._scan_finished_at: Optional[float] = None
         self.setWindowTitle(f"Chat over DNSTT - {self.session.display_name}")
         self.resize(1150, 760)
         self.setAcceptDrops(True)
@@ -600,6 +604,20 @@ class ChatWindow(QMainWindow):
         status_group_layout.addWidget(self.links_list)
         status_group_layout.addWidget(self.last_error_label)
 
+        scanner_group = QGroupBox("Scanner")
+        scanner_group_layout = QVBoxLayout(scanner_group)
+        self.chat_scan_btn = QPushButton("Scan")
+        self.chat_scan_btn.clicked.connect(self._start_chat_scan)
+        self.chat_scan_status = QLabel("")
+        self.chat_scan_status.setWordWrap(True)
+        scanner_group_layout.addWidget(self.chat_scan_btn)
+        scanner_group_layout.addWidget(self.chat_scan_status)
+        if self.transport.mode != "dns":
+            scanner_group.hide()
+        self.scanner_group = scanner_group
+        self.scanner_timer = QTimer(self)
+        self.scanner_timer.timeout.connect(self._poll_chat_scanner)
+
         online_group = QGroupBox("Online")
         online_group_layout = QVBoxLayout(online_group)
         self.online_list = QListWidget()
@@ -608,6 +626,7 @@ class ChatWindow(QMainWindow):
         online_group_layout.addWidget(self.online_list)
 
         right_layout.addWidget(status_group)
+        right_layout.addWidget(scanner_group)
         right_layout.addWidget(online_group)
         right_layout.addStretch(1)
 
@@ -1365,6 +1384,95 @@ class ChatWindow(QMainWindow):
                     return
         super().dropEvent(event)
 
+    def _start_chat_scan(self) -> None:
+        if self.transport.mode != "dns":
+            self._append_system_message("Scan only available in DNS mode")
+            return
+        if self._scanner_proc and self._scanner_proc.poll() is None:
+            self._append_system_message("Scanner already running...")
+            return
+        input_file = Path(self.config.get("scanner_input_file", "")).expanduser()
+        if not input_file.exists():
+            self._append_system_message("Scanner input file not found. Set it in the launcher.")
+            return
+        scanner_script = PROJECT_ROOT / "scanner.py"
+        if not scanner_script.exists():
+            self._append_system_message("scanner.py not found")
+            return
+        self._scanner_output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._scanner_output_path.write_text("")
+        self._scanner_known_ips.clear()
+        self._scan_finished_at = None
+        self._scanner_proc = subprocess.Popen(
+            [sys.executable, str(scanner_script), "-f", str(input_file), "-o", str(self._scanner_output_path)],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.chat_scan_status.setText("Scanning...")
+        self._append_system_message("Scanner started...")
+        self.scanner_timer.start(SCANNER_POLL_INTERVAL_MS)
+
+    def _poll_chat_scanner(self) -> None:
+        if self._scanner_output_path.exists():
+            new_found = False
+            entries = parse_dns_result_file(str(self._scanner_output_path))
+            for ip, _stamp in entries:
+                if ip and ip not in self._scanner_known_ips:
+                    self._scanner_known_ips.add(ip)
+                    if ip not in self.transport.dns_ips:
+                        self._add_chat_scanner_ip(ip)
+                        new_found = True
+            if new_found:
+                self._render_status(self.transport.status, self.transport.last_error)
+        if self._scanner_proc and self._scanner_proc.poll() is None:
+            self.chat_scan_status.setText("Scanning...")
+            return
+        if self._scanner_proc:
+            if self._scan_finished_at is None:
+                self._scan_finished_at = time.time()
+                self._append_system_message(f"Scan complete: {len(self._scanner_known_ips)} IPs found")
+            elapsed = max(0, int(time.time() - self._scan_finished_at))
+            if elapsed < 60:
+                age = "just now"
+            elif elapsed < 3600:
+                age = f"{elapsed // 60}m ago"
+            else:
+                age = f"{elapsed // 3600}h ago"
+            self.chat_scan_status.setText(f"Scanned: {age} ({len(self._scanner_known_ips)} found)")
+            if elapsed > 60:
+                self.scanner_timer.setInterval(60_000)
+
+    def _add_chat_scanner_ip(self, ip: str) -> None:
+        max_port = max(self.transport.proxy_ports) if self.transport.proxy_ports else 7999
+        new_port = max_port + 1
+        self.transport.dns_ips.append(ip)
+        self.transport.proxy_ports.append(new_port)
+        self.transport.status[ip] = "unknown"
+        self.transport.fail_counts[ip] = 0
+        self.transport.last_online_at[ip] = None
+        self.config["dns_ips"] = list(self.transport.dns_ips)
+        self.config["proxy_ports"] = list(self.transport.proxy_ports)
+        if self.slipstream_manager:
+            proc = subprocess.Popen(
+                [
+                    "/usr/local/bin/slipstream-client",
+                    "--tcp-listen-port", str(new_port),
+                    "--resolver", f"{ip}:53",
+                    "--domain", self.transport.domain,
+                ],
+                cwd=str(self.slipstream_manager.slip_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.slipstream_manager.processes.append(proc)
+            self.slipstream_manager.dns_ips.append(ip)
+            self.slipstream_manager.proxy_ports.append(new_port)
+        self._append_system_message(f"Scanner found: {ip}")
+        self._render_status(self.transport.status, self.transport.last_error)
+
     def _start_slipstream_clients(self) -> None:
         self.slipstream_manager = SlipstreamManager(
             slip_path=self.config["slip_path"],
@@ -1402,6 +1510,10 @@ class ChatWindow(QMainWindow):
             self.poll_timer.stop()
         if hasattr(self, "online_timer") and self.online_timer:
             self.online_timer.stop()
+        if hasattr(self, "scanner_timer") and self.scanner_timer:
+            self.scanner_timer.stop()
+        if self._scanner_proc and self._scanner_proc.poll() is None:
+            self._scanner_proc.terminate()
         if self._active_worker:
             self._active_worker.cancel()
         if getattr(self, "_slip_worker", None):
@@ -1861,6 +1973,7 @@ class LauncherWindow(QMainWindow):
             "remote_script": values["remote_script"],
             "dns_ips": values["ips"],
             "proxy_ports": [base_port + idx for idx in range(len(values["ips"]))],
+            "scanner_input_file": self.dns_scan_input.text().strip(),
         }
         startup_lines = [
             "Preparing DNSTT chat session...",
