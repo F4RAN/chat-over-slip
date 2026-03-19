@@ -932,6 +932,8 @@ class ChatView(Static):
         self._scan_timer = None
         self._on_new_dns_ip = on_new_dns_ip
         self._on_restart_link = on_restart_link
+        self._restarting_links = False
+        self._retrying_pending = False
         self._message_filter_mode = "all"
 
     def _has_rtl(self, text: str) -> bool:
@@ -1246,33 +1248,44 @@ class ChatView(Static):
     async def _restart_pending_links(self) -> None:
         """Restart slipstream processes for DNS links that got 'unknown port 65535'.
 
-        Collects pending IPs, shows UI messages on the event loop, then
-        offloads the blocking terminate/wait/spawn work to a thread so
-        the event loop stays responsive for keyboard input.
+        Guards against overlapping restarts — if a previous restart is
+        still running, new pending IPs are left in the queue for next time.
+        UI messages are shown on the event loop, then the blocking
+        terminate/wait/spawn work is offloaded to a thread.
         """
+        if self._restarting_links:
+            return
         pending = self.transport.pop_pending_restarts()
         if not pending or not self._on_restart_link:
             return
-        # Collect restart targets and show UI messages (must be on event loop)
-        targets: list[tuple[str, int]] = []
-        for ip in pending:
-            if ip not in self.transport.dns_ips:
-                continue
-            idx = self.transport.dns_ips.index(ip)
-            port = self.transport.proxy_ports[idx]
-            retry = self.transport.retry_counts.get(ip, 0)
+        self._restarting_links = True
+        try:
+            # Collect restart targets and show a single UI message
+            targets: list[tuple[str, int]] = []
+            for ip in pending:
+                if ip not in self.transport.dns_ips:
+                    continue
+                idx = self.transport.dns_ips.index(ip)
+                port = self.transport.proxy_ports[idx]
+                targets.append((ip, port))
+            if not targets:
+                return
+            ips_text = ", ".join(ip for ip, _ in targets)
             self.write_system(
-                f"[yellow]Retrying DNS link {ip} ({retry}/{DNS_LINK_MAX_RETRIES})[/yellow]"
+                f"[yellow]Retrying {len(targets)} DNS link(s): {ips_text}[/yellow]"
             )
-            targets.append((ip, port))
-        # Offload all blocking subprocess work to a thread
-        if targets:
+            # Offload all blocking subprocess work to a thread
             await asyncio.to_thread(self._do_restart_links, targets)
+        finally:
+            self._restarting_links = False
 
     def _do_restart_links(self, targets: list[tuple[str, int]]) -> None:
-        """Execute link restarts in a background thread (no UI calls)."""
-        for ip, port in targets:
-            self._on_restart_link(ip, port)
+        """Execute link restarts in a background thread (no UI calls).
+
+        Restarts are parallelized so we don't wait 3s × N sequentially.
+        """
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            executor.map(lambda t: self._on_restart_link(t[0], t[1]), targets)
 
     async def _poll_loop(self) -> None:
         while True:
@@ -1390,32 +1403,38 @@ class ChatView(Static):
 
     async def _retry_all_pending(self) -> None:
         """Send all pending messages (SSH mode). Used when back online."""
+        if self._retrying_pending:
+            return
         if not self.pending_messages or self.transport.mode != "ssh":
             return
-        # Snapshot the queue so we can iterate safely
-        to_retry = list(self.pending_messages)
-        for user, text in to_retry:
-            preview = text if len(text) <= 30 else text[:27] + "..."
-            self.write_system(f"[yellow]Retrying pending message: {escape(preview)}[/yellow]")
-            ok, err, statuses = await asyncio.to_thread(
-                self.transport.send_message, user, text
-            )
+        self._retrying_pending = True
+        try:
+            # Snapshot the queue so we can iterate safely
+            to_retry = list(self.pending_messages)
+            for user, text in to_retry:
+                preview = text if len(text) <= 30 else text[:27] + "..."
+                self.write_system(f"[yellow]Retrying pending message: {escape(preview)}[/yellow]")
+                ok, err, statuses = await asyncio.to_thread(
+                    self.transport.send_message, user, text
+                )
+                self._render_status_panel(statuses)
+                if not ok:
+                    self.write_system(f"[red]Retry failed: {escape(err or 'no working link')}[/red]")
+                    return  # stop draining — link may be down again
+                self.write_system(f"[green]Retry succeeded[/green]")
+                try:
+                    self.pending_messages.remove((user, text))
+                except ValueError:
+                    pass
+            snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
             self._render_status_panel(statuses)
-            if not ok:
-                self.write_system(f"[red]Retry failed: {escape(err or 'no working link')}[/red]")
-                return  # stop draining — link may be down again
-            self.write_system(f"[green]Retry succeeded[/green]")
-            try:
-                self.pending_messages.remove((user, text))
-            except ValueError:
-                pass
-        snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-        self._render_status_panel(statuses)
-        if snapshot is not None:
-            self.last_snapshot = snapshot
-            self._render_snapshot(snapshot)
-        else:
-            self._render_snapshot(self.last_snapshot)
+            if snapshot is not None:
+                self.last_snapshot = snapshot
+                self._render_snapshot(snapshot)
+            else:
+                self._render_snapshot(self.last_snapshot)
+        finally:
+            self._retrying_pending = False
 
     async def _send_text_background(self, text: str) -> None:
         ok, err, statuses = await asyncio.to_thread(self.transport.send_message, self.display_name, text)
