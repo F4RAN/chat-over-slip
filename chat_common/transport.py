@@ -172,7 +172,6 @@ class ChatTransport:
             "timed out",
             "connection closed",
             "banner exchange",
-            "unknown port 65535",
             "waiting for network",
             "kex_exchange_identification",
             "connection reset by peer",
@@ -271,12 +270,20 @@ class ChatTransport:
                 except OSError:
                     pass
 
+    def _is_removed(self, label: str) -> bool:
+        """True if *label* was removed via remove_dns_link."""
+        return self.mode == "dns" and label not in self.dns_ips and label != "ssh"
+
     def _mark_success(self, label: str) -> None:
+        if self._is_removed(label):
+            return
         self.status[label] = "ok"
         self.fail_counts[label] = 0
         self.last_online_at[label] = datetime.now(timezone.utc)
 
     def _mark_failure(self, label: str, error: str) -> None:
+        if self._is_removed(label):
+            return
         self.fail_counts[label] = self.fail_counts.get(label, 0) + 1
         if self._soft_error(error):
             if self.status.get(label) == "ok" and self.fail_counts[label] < SOFT_ERROR_OK_GRACE_FAILURES:
