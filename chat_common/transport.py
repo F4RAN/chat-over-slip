@@ -282,6 +282,8 @@ class ChatTransport:
     def _mark_success(self, label: str) -> None:
         if self._is_removed(label):
             return
+        if self.retry_counts.get(label, 0) >= DNS_LINK_MAX_RETRIES:
+            return  # permanently failed, ignore stale success
         self.status[label] = "ok"
         self.fail_counts[label] = 0
         self.retry_counts[label] = 0
@@ -293,20 +295,24 @@ class ChatTransport:
     def _mark_failure(self, label: str, error: str) -> None:
         if self._is_removed(label):
             return
+        # Link exhausted its restart retries — permanently failed.
+        if self.retry_counts.get(label, 0) >= DNS_LINK_MAX_RETRIES and self._needs_restart(error):
+            self.status[label] = "fail"
+            return
         self.fail_counts[label] = self.fail_counts.get(label, 0) + 1
-        if self._soft_error(error):
+        if self._needs_restart(error):
+            self.retry_counts[label] = self.retry_counts.get(label, 0) + 1
+            self.status[label] = "unknown"
+            self.fail_counts[label] = 0
+            if label not in self._pending_restarts:
+                self._pending_restarts.append(label)
+        elif self._soft_error(error):
             if self.status.get(label) == "ok" and self.fail_counts[label] < SOFT_ERROR_OK_GRACE_FAILURES:
                 self.status[label] = "ok"
             elif self.fail_counts[label] < SOFT_ERROR_UNKNOWN_GRACE_FAILURES:
                 self.status[label] = "unknown"
             else:
                 self.status[label] = "fail"
-        elif self._needs_restart(error) and self.retry_counts.get(label, 0) < DNS_LINK_MAX_RETRIES:
-            self.retry_counts[label] = self.retry_counts.get(label, 0) + 1
-            self.status[label] = "unknown"
-            self.fail_counts[label] = 0
-            if label not in self._pending_restarts:
-                self._pending_restarts.append(label)
         else:
             self.status[label] = "fail"
 
