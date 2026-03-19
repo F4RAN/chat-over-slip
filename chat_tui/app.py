@@ -1255,7 +1255,7 @@ class ChatView(Static):
             port = self.transport.proxy_ports[idx]
             retry = self.transport.retry_counts.get(ip, 0)
             self.write_system(
-                f"[yellow]Retrying DNS link {ip} ({retry}/2)[/yellow]"
+                f"[yellow]Retrying DNS link {ip} ({retry}/{DNS_LINK_MAX_RETRIES})[/yellow]"
             )
             self._on_restart_link(ip, port)
 
@@ -1274,7 +1274,7 @@ class ChatView(Static):
                     and self.transport.mode == "ssh"
                 ):
                     await self._retry_all_pending()
-                self._restart_pending_links()
+                await asyncio.to_thread(self._restart_pending_links)
             except Exception as exc:
                 self.transport.last_error = str(exc)
                 self._render_status_panel(self.transport.status)
