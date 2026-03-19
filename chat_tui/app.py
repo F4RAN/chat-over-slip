@@ -25,7 +25,9 @@ from rich import box
 from rich.align import Align
 from rich.console import Group
 from rich.markup import escape
+from rich.measure import Measurement
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -663,6 +665,33 @@ class UploadInput(Input):
         super()._on_paste(event)
 
 
+class BidiSafe:
+    """Wraps a Rich renderable and adds LTR Isolate markers to each rendered line.
+
+    Terminal bidi algorithms operate per-line. When RTL characters appear on the
+    same line as Panel border chars (│, ╭, ╰, …), the terminal may reorder the
+    entire line, breaking the TUI layout.  This wrapper renders the inner object
+    first, then prepends U+2066 (LRI) and appends U+2069 (PDI) to every output
+    line, forcing the terminal to treat each line as LTR-isolated.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __rich_console__(self, console, options):
+        lri = Segment("\u2066")
+        pdi = Segment("\u2069")
+        newline = Segment("\n")
+        for line_segments in console.render_lines(self.inner, options, pad=False):
+            yield lri
+            yield from line_segments
+            yield pdi
+            yield newline
+
+    def __rich_measure__(self, console, options):
+        return Measurement.get(console, options, self.inner)
+
+
 class ChatView(Static):
     DEFAULT_CSS = """
     ChatView {
@@ -679,7 +708,6 @@ class ChatView(Static):
         height: 1fr;
         padding: 1 2;
         border: solid $primary;
-        overflow-x: hidden;
     }
     #status {
         width: 28;
@@ -720,21 +748,10 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Wrap RTL text safely to prevent terminal bidi from breaking TUI layout.
-
-        Inserts LRM (Left-to-Right Mark) at the start and after each newline so
-        the terminal's bidi algorithm keeps paragraph direction as LTR.  This
-        keeps Panel borders and the sidebar in place while RTL text still renders
-        correctly within its runs.
-        """
-        if not text or not self._has_rtl(text):
-            return Text.from_markup(text)
-        # Anchor every line as LTR-paragraph so terminal bidi won't reorder
-        # panel borders or bleed into adjacent widgets.
-        lrm = "\u200E"
-        anchored = lrm + text.replace("\n", "\n" + lrm)
-        t = Text.from_markup(anchored)
-        t.justify = "right"
+        """Return a Rich Text for the message body, right-justified for RTL."""
+        t = Text.from_markup(text or "")
+        if text and self._has_rtl(text):
+            t.justify = "right"
         return t
 
     def _play_notification_sound(self) -> None:
@@ -761,7 +778,8 @@ class ChatView(Static):
         if pending:
             body.append(" (pending)", style="yellow")
         header = f"[dim]{now}[/] [bold]{user}[/]"
-        self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
+        panel = Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED)
+        self.chat_area.write(BidiSafe(panel) if self._has_rtl(text) else panel)
 
     def write_system(self, text: str, style: str = "dim") -> None:
         self.chat_area.write(f"[{style}]{text}[/{style}]")
@@ -851,7 +869,8 @@ class ChatView(Static):
                     display_text, file_entry = self._parse_file_message(text)
                     body = self._rtl_wrap(display_text)
                     header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
+                    panel = Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED)
+                    self.chat_area.write(BidiSafe(panel) if self._has_rtl(text) else panel)
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
