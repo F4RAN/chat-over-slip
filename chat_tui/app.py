@@ -1263,13 +1263,13 @@ class ChatView(Static):
                 if snapshot is not None and snapshot != self.last_snapshot:
                     self.last_snapshot = snapshot
                     self._render_snapshot(snapshot)
-                # When SSH is back online, retry one pending message per poll
+                # When SSH is back online, retry all pending messages
                 if (
                     snapshot is not None
                     and self.pending_messages
                     and self.transport.mode == "ssh"
                 ):
-                    await self._retry_one_pending()
+                    await self._retry_all_pending()
                 self._restart_pending_links()
             except Exception as exc:
                 self.transport.last_error = str(exc)
@@ -1366,25 +1366,27 @@ class ChatView(Static):
         self._render_snapshot(self.last_snapshot)
         asyncio.create_task(self._send_text_background(text))
 
-    async def _retry_one_pending(self) -> None:
-        """Send the oldest pending message once (SSH mode). Used when back online."""
+    async def _retry_all_pending(self) -> None:
+        """Send all pending messages (SSH mode). Used when back online."""
         if not self.pending_messages or self.transport.mode != "ssh":
             return
-        user, text = self.pending_messages[0]
-        preview = text if len(text) <= 30 else text[:27] + "..."
-        self.write_system(f"[yellow]Retrying pending message: {escape(preview)}[/yellow]")
-        ok, err, statuses = await asyncio.to_thread(
-            self.transport.send_message, user, text
-        )
-        self._render_status_panel(statuses)
-        if not ok:
-            self.write_system(f"[red]Retry failed: {escape(err or 'no working link')}[/red]")
-            return
-        self.write_system(f"[green]Retry succeeded[/green]")
-        try:
-            self.pending_messages.remove((user, text))
-        except ValueError:
-            pass
+        # Snapshot the queue so we can iterate safely
+        to_retry = list(self.pending_messages)
+        for user, text in to_retry:
+            preview = text if len(text) <= 30 else text[:27] + "..."
+            self.write_system(f"[yellow]Retrying pending message: {escape(preview)}[/yellow]")
+            ok, err, statuses = await asyncio.to_thread(
+                self.transport.send_message, user, text
+            )
+            self._render_status_panel(statuses)
+            if not ok:
+                self.write_system(f"[red]Retry failed: {escape(err or 'no working link')}[/red]")
+                return  # stop draining — link may be down again
+            self.write_system(f"[green]Retry succeeded[/green]")
+            try:
+                self.pending_messages.remove((user, text))
+            except ValueError:
+                pass
         snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
         self._render_status_panel(statuses)
         if snapshot is not None:
