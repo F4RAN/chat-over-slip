@@ -119,7 +119,6 @@ def _setup_crash_logging() -> None:
     log.addHandler(file_handler)
     log.setLevel(logging.DEBUG)
     log.info("=== App start (PID %d) === log_dir=%s", os.getpid(), log_dir)
-    print(f"[chat-over-dnstt] Logs: {log_dir}", file=sys.stderr, flush=True)
 
     try:
         f = open(CRASH_LOG_PATH, "a", encoding="utf-8")
@@ -708,6 +707,19 @@ class ChatWindow(QMainWindow):
         refresh_action = QAction("Refresh Now", self)
         refresh_action.triggered.connect(self._poll)
         menu.addAction(refresh_action)
+        logs_action = QAction("Open Logs Folder", self)
+        logs_action.triggered.connect(self._open_logs_folder)
+        menu.addAction(logs_action)
+
+    def _open_logs_folder(self) -> None:
+        import subprocess as _sp
+        log_dir = str(_LOG_DIR)
+        if sys.platform == "darwin":
+            _sp.Popen(["open", log_dir])
+        elif sys.platform == "win32":
+            os.startfile(log_dir)
+        else:
+            _sp.Popen(["xdg-open", log_dir])
 
     def _has_transport_task(self, kind: str) -> bool:
         return self._active_transport_kind == kind or any(task_kind == kind for task_kind, _fn, _callback in self._transport_queue)
