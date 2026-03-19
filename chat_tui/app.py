@@ -1243,11 +1243,18 @@ class ChatView(Static):
             self.transport.last_error = str(exc)
             self._render_status_panel(self.transport.status)
 
-    def _restart_pending_links(self) -> None:
-        """Restart slipstream processes for DNS links that got 'unknown port 65535'."""
+    async def _restart_pending_links(self) -> None:
+        """Restart slipstream processes for DNS links that got 'unknown port 65535'.
+
+        Collects pending IPs, shows UI messages on the event loop, then
+        offloads the blocking terminate/wait/spawn work to a thread so
+        the event loop stays responsive for keyboard input.
+        """
         pending = self.transport.pop_pending_restarts()
         if not pending or not self._on_restart_link:
             return
+        # Collect restart targets and show UI messages (must be on event loop)
+        targets: list[tuple[str, int]] = []
         for ip in pending:
             if ip not in self.transport.dns_ips:
                 continue
@@ -1257,6 +1264,14 @@ class ChatView(Static):
             self.write_system(
                 f"[yellow]Retrying DNS link {ip} ({retry}/{DNS_LINK_MAX_RETRIES})[/yellow]"
             )
+            targets.append((ip, port))
+        # Offload all blocking subprocess work to a thread
+        if targets:
+            await asyncio.to_thread(self._do_restart_links, targets)
+
+    def _do_restart_links(self, targets: list[tuple[str, int]]) -> None:
+        """Execute link restarts in a background thread (no UI calls)."""
+        for ip, port in targets:
             self._on_restart_link(ip, port)
 
     async def _poll_loop(self) -> None:
@@ -1267,14 +1282,17 @@ class ChatView(Static):
                 if snapshot is not None and snapshot != self.last_snapshot:
                     self.last_snapshot = snapshot
                     self._render_snapshot(snapshot)
-                # When SSH is back online, retry all pending messages
+                # When SSH is back online, retry all pending messages.
+                # Fire as independent task so poll loop continues.
                 if (
                     snapshot is not None
                     and self.pending_messages
                     and self.transport.mode == "ssh"
                 ):
-                    await self._retry_all_pending()
-                await asyncio.to_thread(self._restart_pending_links)
+                    asyncio.create_task(self._retry_all_pending())
+                # Restart failed DNS links as independent task so poll
+                # loop is never blocked by subprocess terminate/wait.
+                asyncio.create_task(self._restart_pending_links())
             except Exception as exc:
                 self.transport.last_error = str(exc)
                 self._render_status_panel(self.transport.status)
