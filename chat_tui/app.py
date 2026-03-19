@@ -673,6 +673,24 @@ class StatusPanel(Static):
         self.update("\n".join(lines))
 
 
+class DNSLinkLabel(Static):
+    """A clickable label for a DNS link. Failed links post a remove request on click."""
+
+    def __init__(self, ip: str, is_fail: bool, label_text: str, **kwargs) -> None:
+        super().__init__(label_text, **kwargs)
+        self.ip = ip
+        self.is_fail = is_fail
+
+    def on_click(self) -> None:
+        if self.is_fail:
+            node = self.parent
+            while node:
+                if hasattr(node, "_remove_dns_link"):
+                    asyncio.create_task(node._remove_dns_link(self.ip))
+                    return
+                node = node.parent
+
+
 class UploadInput(Input):
     def _extract_file_path(self, text: str) -> Optional[str]:
         line = text.strip()
@@ -751,17 +769,12 @@ class ChatView(Static):
         layout: vertical;
         padding: 0;
     }
-    .dns-link-btn {
-        height: 1;
+    .dns-link {
+        height: auto;
         width: 1fr;
-        margin: 0;
-        padding: 0;
-        border: none;
-        text-style: none;
-        content-align: left middle;
+        padding: 0 1;
     }
     .dns-link-fail {
-        background: $surface-darken-1;
         color: red;
     }
     .dns-link-fail:hover {
@@ -769,11 +782,9 @@ class ChatView(Static):
         color: white;
     }
     .dns-link-ok {
-        background: $surface-darken-1;
         color: green;
     }
     .dns-link-unknown {
-        background: $surface-darken-1;
         color: yellow;
     }
     #error-text {
@@ -1093,28 +1104,26 @@ class ChatView(Static):
         if snapshot == self._last_link_snapshot:
             return
         self._last_link_snapshot = snapshot
-        # Remove old buttons
+        # Remove old labels
         for child in list(self.dns_btns_container.children):
             child.remove()
-        # Create a button for each link
+        # Create a label for each link
         for ip, state in statuses.items():
             age_text = StatusPanel._format_age(ages.get(ip))
-            label = f"{ip}: {age_text}"
-            if state == "fail":
-                btn = Button(f"[x] {label}", classes="dns-link-btn dns-link-fail")
-                btn.dns_ip = ip
+            is_fail = state == "fail"
+            if is_fail:
+                text = f"[red][x] {ip}: {age_text}[/red]"
             elif state == "ok":
-                btn = Button(label, classes="dns-link-btn dns-link-ok", disabled=True)
+                text = f"[green]{ip}: {age_text}[/green]"
             else:
-                btn = Button(label, classes="dns-link-btn dns-link-unknown", disabled=True)
-            self.dns_btns_container.mount(btn)
+                text = f"[yellow]{ip}: {age_text}[/yellow]"
+            state_cls = f"dns-link-{state}" if state in ("fail", "ok", "unknown") else "dns-link-unknown"
+            lbl = DNSLinkLabel(ip, is_fail, text, classes=f"dns-link {state_cls}")
+            self.dns_btns_container.mount(lbl)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "scan-btn":
             self._start_scan()
-            return
-        if hasattr(event.button, "dns_ip"):
-            asyncio.create_task(self._remove_dns_link(event.button.dns_ip))
 
     async def refresh_now(self) -> None:
         try:
