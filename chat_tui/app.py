@@ -719,32 +719,42 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Return right-justified Text, hard-wrapped to fit inside the panel.
+        """Return right-justified Text with LRM anchors to stay inside the panel.
 
-        The terminal's bidi algorithm reorders RTL characters across the full
-        terminal line width, so no matter how Rich clips the text the terminal
-        may place glyphs outside the panel border.  The only reliable fix is
-        to ensure no logical line is wider than the available panel content
-        area *before* the terminal sees it.
+        Terminal bidi algorithms determine paragraph direction from the first
+        strong character on each *terminal* line.  Rich Panel borders (│) and
+        padding spaces are bidi-neutral, so the first strong char is the RTL
+        text itself – the terminal sets RTL paragraph direction and pushes
+        the content to the right edge of the terminal, overflowing the panel.
+
+        Fix: prepend U+200E LEFT-TO-RIGHT MARK (invisible, zero-width) at the
+        start of every logical line.  The terminal sees LRM as the first strong
+        character → LTR paragraph direction → RTL text stays embedded inside
+        the panel.  We also pre-wrap text with textwrap so Rich doesn't
+        re-wrap lines and lose the per-line LRM anchors.
         """
         if not text:
             return Text.from_markup("")
         if not self._has_rtl(text):
             return Text.from_markup(text)
         import textwrap
+        LRM = "\u200E"
         # Panel uses 2 border chars + padding=(0,1) → 4 cols overhead.
-        # Fall back to a safe default if the widget isn't laid out yet.
         try:
-            max_w = max(20, self.chat_area.content_size.width - 4)
+            max_w = max(20, self.chat_area.content_size.width - 6)
         except Exception:
-            max_w = 72
+            max_w = 70
         plain = Text.from_markup(text).plain
-        # Wrap each paragraph independently so existing newlines are kept.
-        paragraphs = plain.split("\n")
-        wrapped_lines = []
-        for para in paragraphs:
-            wrapped_lines.append(textwrap.fill(para, width=max_w) if para.strip() else "")
-        t = Text("\n".join(wrapped_lines))
+        result_lines: list[str] = []
+        for para in plain.split("\n"):
+            if para.strip():
+                filled = textwrap.fill(para, width=max_w)
+                # Anchor each wrapped line with LRM to force LTR paragraph dir.
+                for line in filled.split("\n"):
+                    result_lines.append(LRM + line)
+            else:
+                result_lines.append("")
+        t = Text("\n".join(result_lines))
         t.justify = "right"
         return t
 
