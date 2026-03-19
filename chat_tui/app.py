@@ -661,6 +661,7 @@ class StatusPanel(Static):
         statuses: Dict[str, str],
         last_error: str = "",
         ages: Optional[Dict[str, Optional[int]]] = None,
+        scanner_text: str = "",
     ) -> None:
         lines = [f"[bold]Mode[/]: {mode}"]
         if not statuses:
@@ -672,8 +673,15 @@ class StatusPanel(Static):
             for label, state in statuses.items():
                 color = "yellow" if state == "unknown" else ("green" if state == "ok" else "red")
                 age = self._format_age((ages or {}).get(label))
-                suffix = "  [bold red]x[/bold red]" if state == "fail" and mode == "DNS" else ""
-                lines.append(f"[{color}]{label}: {age}{suffix}[/{color}]")
+                line = f"[{color}]{label}: {age}[/{color}]"
+                if state == "fail" and mode == "DNS":
+                    line += f" [@click=\"remove_dns('{label}')\"][bold red]\\[x][/bold red][/]"
+                lines.append(line)
+        if mode == "DNS":
+            lines += [""]
+            lines.append("[@click=\"start_scan()\"][bold cyan]\\[ Scan ][/bold cyan][/]")
+            if scanner_text:
+                lines.append(f"[dim]{scanner_text}[/dim]")
         if last_error:
             lines += ["", "[bold]Last Error[/]", f"[red]{last_error}[/red]"]
         self.update("\n".join(lines))
@@ -757,7 +765,14 @@ class ChatView(Static):
     }
     """
 
-    def __init__(self, transport: ChatTransport, display_name: str, startup_lines: Optional[List[str]] = None):
+    def __init__(
+        self,
+        transport: ChatTransport,
+        display_name: str,
+        startup_lines: Optional[List[str]] = None,
+        scanner_input_file: str = "",
+        on_new_dns_ip: Optional[Callable[[str, int], None]] = None,
+    ):
         super().__init__()
         self.transport = transport
         self.display_name = display_name or os.environ.get("USER", "anon")
@@ -768,6 +783,13 @@ class ChatView(Static):
         self.upload_status: Dict[str, str] = {}
         self.available_files: Dict[str, str] = {}
         self.seen_msg_ids: set = set()
+        self.scanner_input_file = scanner_input_file
+        self._scanner_proc: Optional[subprocess.Popen] = None
+        self._scanner_output_path = APP_RUNTIME_ROOT / "scanner-result.txt"
+        self._scanner_known_ips: set = set()
+        self._scan_finished_at: Optional[float] = None
+        self._scan_timer = None
+        self._on_new_dns_ip = on_new_dns_ip
 
     def _has_rtl(self, text: str) -> bool:
         for c in (text or ""):
@@ -842,6 +864,94 @@ class ChatView(Static):
             body.append(" (pending)", style="yellow")
         self.chat_area.write(body)
 
+    def action_remove_dns(self, ip: str) -> None:
+        asyncio.create_task(self._remove_dns_link(ip))
+
+    def action_start_scan(self) -> None:
+        self._start_scan()
+
+    def _scanner_status_text(self) -> str:
+        if self.transport.mode != "dns":
+            return ""
+        if self._scanner_proc and self._scanner_proc.poll() is None:
+            return "Scanning..."
+        if self._scanner_proc and self._scan_finished_at is not None:
+            elapsed = max(0, int(time.time() - self._scan_finished_at))
+            if elapsed < 60:
+                age = "just now"
+            elif elapsed < 3600:
+                age = f"{elapsed // 60}m ago"
+            else:
+                age = f"{elapsed // 3600}h ago"
+            return f"Scanned: {age} ({len(self._scanner_known_ips)} found)"
+        return ""
+
+    def _start_scan(self, input_file: str = "") -> None:
+        if self.transport.mode != "dns":
+            self.write_system("[red]Scan only available in DNS mode[/]")
+            return
+        if self._scanner_proc and self._scanner_proc.poll() is None:
+            self.write_system("[yellow]Scanner already running...[/]")
+            return
+        input_path = Path(input_file or self.scanner_input_file).expanduser()
+        if not input_path.exists():
+            self.write_system("[red]Scanner input file not found. Use /scan <path>[/]")
+            return
+        scanner_script = APP_RESOURCE_ROOT / "scanner.py"
+        if not scanner_script.exists():
+            self.write_system("[red]scanner.py not found[/]")
+            return
+        self._scanner_output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._scanner_output_path.write_text("")
+        self._scanner_known_ips.clear()
+        self._scan_finished_at = None
+        self._scanner_proc = subprocess.Popen(
+            [sys.executable, str(scanner_script), "-f", str(input_path), "-o", str(self._scanner_output_path)],
+            cwd=str(APP_RESOURCE_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.write_system("[yellow]Scanner started...[/]")
+        self._render_status_panel(self.transport.status)
+        if self._scan_timer:
+            self._scan_timer.resume()
+
+    def _poll_scanner(self) -> None:
+        if self._scanner_output_path.exists():
+            new_found = False
+            for line in self._scanner_output_path.read_text().splitlines():
+                if "IP:" in line and "Time:" in line:
+                    parts = line.split("IP:")[1].strip().split("-")
+                    ip = parts[0].strip()
+                    if ip and ip not in self._scanner_known_ips:
+                        self._scanner_known_ips.add(ip)
+                        if ip not in self.transport.dns_ips:
+                            self._add_scanner_ip(ip)
+                            new_found = True
+            if new_found:
+                self._render_status_panel(self.transport.status)
+        if self._scanner_proc and self._scanner_proc.poll() is not None:
+            if self._scan_finished_at is None:
+                self._scan_finished_at = time.time()
+                self.write_system(f"[green]Scan complete[/]: {len(self._scanner_known_ips)} IPs found")
+            self._render_status_panel(self.transport.status)
+        if not self._scanner_proc or self._scanner_proc.poll() is not None:
+            if self._scan_timer and self._scan_finished_at:
+                self._scan_timer.pause()
+
+    def _add_scanner_ip(self, ip: str) -> None:
+        max_port = max(self.transport.proxy_ports) if self.transport.proxy_ports else 7999
+        new_port = max_port + 1
+        self.transport.dns_ips.append(ip)
+        self.transport.proxy_ports.append(new_port)
+        self.transport.status[ip] = "unknown"
+        self.transport.fail_counts[ip] = 0
+        self.transport.last_online_at[ip] = None
+        self.write_system(f"[green]Scanner found:[/] {ip}")
+        if self._on_new_dns_ip:
+            self._on_new_dns_ip(ip, new_port)
+
     def _play_notification_sound(self) -> None:
         def _run() -> None:
             try:
@@ -905,6 +1015,7 @@ class ChatView(Static):
         self._render_status_panel(self.transport.status)
         asyncio.create_task(self.refresh_now())
         self.poll_task = asyncio.create_task(self._poll_loop())
+        self._scan_timer = self.set_interval(2, self._poll_scanner, pause=True)
 
     def _render_status_panel(self, statuses: Dict[str, str]) -> None:
         ages = {label: self.transport.last_online_age_seconds(label) for label in statuses}
@@ -913,6 +1024,7 @@ class ChatView(Static):
             statuses,
             self.transport.last_error,
             ages,
+            scanner_text=self._scanner_status_text(),
         )
 
     async def refresh_now(self) -> None:
@@ -1176,6 +1288,11 @@ class ChatView(Static):
                 return
             await self._remove_dns_link(ip)
             return
+        if text.startswith("/scan"):
+            parts = text.split(maxsplit=1)
+            input_file = parts[1].strip() if len(parts) > 1 else ""
+            self._start_scan(input_file)
+            return
         await self._send_text(text)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1191,6 +1308,10 @@ class ChatView(Static):
     def shutdown(self) -> None:
         if self.poll_task:
             self.poll_task.cancel()
+        if self._scan_timer:
+            self._scan_timer.pause()
+        if self._scanner_proc and self._scanner_proc.poll() is None:
+            self._scanner_proc.terminate()
 
 
 class ChatApp(App):
@@ -1202,15 +1323,16 @@ class ChatApp(App):
 
     BINDINGS = [Binding("q", "quit", "Quit")]
 
-    def __init__(self, transport: ChatTransport, display_name: str):
+    def __init__(self, transport: ChatTransport, display_name: str, scanner_input_file: str = ""):
         super().__init__()
         self.transport = transport
         self.display_name = display_name or os.environ.get("USER", "anon")
+        self.scanner_input_file = scanner_input_file
         self.chat_view: Optional[ChatView] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        self.chat_view = ChatView(self.transport, self.display_name)
+        self.chat_view = ChatView(self.transport, self.display_name, scanner_input_file=self.scanner_input_file)
         yield self.chat_view
         yield Footer()
 
@@ -1235,6 +1357,7 @@ def main() -> None:
     parser.add_argument("--display-name", default="")
     parser.add_argument("--proxy-ports", default="")
     parser.add_argument("--dns-ips", default="")
+    parser.add_argument("--scanner-input", default="")
     args = parser.parse_args()
 
     proxy_ports = [int(item.strip()) for item in args.proxy_ports.split(",") if item.strip()]
@@ -1250,7 +1373,7 @@ def main() -> None:
         proxy_ports=proxy_ports,
         dns_ips=dns_ips,
     )
-    app = ChatApp(transport=transport, display_name=args.display_name or args.ssh_user)
+    app = ChatApp(transport=transport, display_name=args.display_name or args.ssh_user, scanner_input_file=args.scanner_input)
     app.run()
 
 
