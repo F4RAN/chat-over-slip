@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import pty
 import re
@@ -81,9 +81,11 @@ class ChatTransport:
         if mode == "dns":
             self.status = {ip: "unknown" for ip in self.dns_ips}
             self.fail_counts = {ip: 0 for ip in self.dns_ips}
+            self.last_online_at = {ip: None for ip in self.dns_ips}
         else:
             self.status = {"ssh": "unknown"}
             self.fail_counts = {"ssh": 0}
+            self.last_online_at = {"ssh": None}
         self.last_error = ""
 
     def _normalize_remote_script(self, path: str) -> str:
@@ -291,6 +293,7 @@ class ChatTransport:
     def _mark_success(self, label: str) -> None:
         self.status[label] = "ok"
         self.fail_counts[label] = 0
+        self.last_online_at[label] = datetime.now(timezone.utc)
 
     def _mark_failure(self, label: str, error: str) -> None:
         self.fail_counts[label] = self.fail_counts.get(label, 0) + 1
@@ -303,6 +306,39 @@ class ChatTransport:
                 self.status[label] = "fail"
         else:
             self.status[label] = "fail"
+
+    def last_online_age_seconds(self, label: str, now: Optional[datetime] = None) -> Optional[int]:
+        when = self.last_online_at.get(label)
+        if when is None:
+            return None
+        if now is None:
+            now = datetime.now(timezone.utc)
+        return max(0, int((now - when).total_seconds()))
+
+    def remove_dns_link(self, label: str) -> bool:
+        if self.mode != "dns":
+            return False
+        if label not in self.dns_ips:
+            return False
+        idx = self.dns_ips.index(label)
+        self.dns_ips.pop(idx)
+        if idx < len(self.proxy_ports):
+            self.proxy_ports.pop(idx)
+        self.status.pop(label, None)
+        self.fail_counts.pop(label, None)
+        self.last_online_at.pop(label, None)
+        return True
+
+    @staticmethod
+    def normalize_news_range(range_spec: str) -> str:
+        value = (range_spec or "").strip()
+        if not value:
+            return "10"
+        if " " in value and "-" not in value:
+            parts = [p for p in value.split() if p]
+            if len(parts) == 2 and all(p.isdigit() for p in parts):
+                return f"{parts[0]}-{parts[1]}"
+        return value
 
     def read_messages(self, limit: int = 200) -> Tuple[Optional[str], Dict[str, str]]:
         if self.mode == "ssh":
@@ -413,7 +449,8 @@ class ChatTransport:
         return False, "clear failed"
 
     def fetch_news(self, channel: str, range_spec: str) -> Tuple[bool, str, Dict[str, str]]:
-        remote_command = f"bash {self.remote_script} -g {shlex.quote(channel)} {shlex.quote(range_spec)}"
+        normalized_range = self.normalize_news_range(range_spec)
+        remote_command = f"bash {self.remote_script} -g {shlex.quote(channel)} {shlex.quote(normalized_range)}"
 
         if self.mode == "ssh":
             try:
@@ -598,6 +635,18 @@ class ChatTransport:
 
 
 class StatusPanel(Static):
+    @staticmethod
+    def _format_age(age_seconds: Optional[int]) -> str:
+        if age_seconds is None:
+            return "never"
+        if age_seconds < 60:
+            return "now"
+        if age_seconds < 3600:
+            return f"{age_seconds // 60}m ago"
+        if age_seconds < 86400:
+            return f"{age_seconds // 3600}h ago"
+        return f"{age_seconds // 86400}d ago"
+
     def _overall_state(self, statuses: Dict[str, str]) -> Tuple[str, str]:
         values = list(statuses.values())
         if any(state == "ok" for state in values):
@@ -606,7 +655,13 @@ class StatusPanel(Static):
             return "waiting", "yellow"
         return "offline", "red"
 
-    def render_status(self, mode: str, statuses: Dict[str, str], last_error: str = "") -> None:
+    def render_status(
+        self,
+        mode: str,
+        statuses: Dict[str, str],
+        last_error: str = "",
+        ages: Optional[Dict[str, Optional[int]]] = None,
+    ) -> None:
         lines = [f"[bold]Mode[/]: {mode}"]
         if not statuses:
             lines += ["", "[dim]No link status yet[/]"]
@@ -616,7 +671,9 @@ class StatusPanel(Static):
             lines += ["", "[bold]Links[/]"]
             for label, state in statuses.items():
                 color = "yellow" if state == "unknown" else ("green" if state == "ok" else "red")
-                lines.append(f"[{color}]{label}: {state}[/{color}]")
+                age = self._format_age((ages or {}).get(label))
+                suffix = "  [bold red]x[/bold red]" if state == "fail" and mode == "DNS" else ""
+                lines.append(f"[{color}]{label}: {age}{suffix}[/{color}]")
         if last_error:
             lines += ["", "[bold]Last Error[/]", f"[red]{last_error}[/red]"]
         self.update("\n".join(lines))
@@ -845,26 +902,35 @@ class ChatView(Static):
         self.input_w = self.query_one("#msg-input", Input)
         for line in self.startup_lines:
             self.write_system(line)
-        self.status_panel.render_status(self.transport.mode.upper(), self.transport.status, self.transport.last_error)
+        self._render_status_panel(self.transport.status)
         asyncio.create_task(self.refresh_now())
         self.poll_task = asyncio.create_task(self._poll_loop())
+
+    def _render_status_panel(self, statuses: Dict[str, str]) -> None:
+        ages = {label: self.transport.last_online_age_seconds(label) for label in statuses}
+        self.status_panel.render_status(
+            self.transport.mode.upper(),
+            statuses,
+            self.transport.last_error,
+            ages,
+        )
 
     async def refresh_now(self) -> None:
         try:
             snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-            self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+            self._render_status_panel(statuses)
             if snapshot is not None:
                 self.last_snapshot = snapshot
                 self._render_snapshot(snapshot)
         except Exception as exc:
             self.transport.last_error = str(exc)
-            self.status_panel.render_status(self.transport.mode.upper(), self.transport.status, self.transport.last_error)
+            self._render_status_panel(self.transport.status)
 
     async def _poll_loop(self) -> None:
         while True:
             try:
                 snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-                self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+                self._render_status_panel(statuses)
                 if snapshot is not None and snapshot != self.last_snapshot:
                     self.last_snapshot = snapshot
                     self._render_snapshot(snapshot)
@@ -877,7 +943,7 @@ class ChatView(Static):
                     await self._retry_one_pending()
             except Exception as exc:
                 self.transport.last_error = str(exc)
-                self.status_panel.render_status(self.transport.mode.upper(), self.transport.status, self.transport.last_error)
+                self._render_status_panel(self.transport.status)
             await asyncio.sleep(STATUS_POLL_INTERVAL)
 
     def _render_snapshot(self, snapshot: str) -> None:
@@ -969,9 +1035,7 @@ class ChatView(Static):
         ok, err, statuses = await asyncio.to_thread(
             self.transport.send_message, user, text
         )
-        self.status_panel.render_status(
-            self.transport.mode.upper(), statuses, self.transport.last_error
-        )
+        self._render_status_panel(statuses)
         if not ok:
             return
         try:
@@ -979,9 +1043,7 @@ class ChatView(Static):
         except ValueError:
             pass
         snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-        self.status_panel.render_status(
-            self.transport.mode.upper(), statuses, self.transport.last_error
-        )
+        self._render_status_panel(statuses)
         if snapshot is not None:
             self.last_snapshot = snapshot
             self._render_snapshot(snapshot)
@@ -990,7 +1052,7 @@ class ChatView(Static):
 
     async def _send_text_background(self, text: str) -> None:
         ok, err, statuses = await asyncio.to_thread(self.transport.send_message, self.display_name, text)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+        self._render_status_panel(statuses)
         if not ok:
             self.chat_area.write(f"[red]Send failed[/]: {err or 'no working link'}")
             return
@@ -999,7 +1061,7 @@ class ChatView(Static):
         except ValueError:
             pass
         snapshot, statuses = await asyncio.to_thread(self.transport.read_messages, 200)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+        self._render_status_panel(statuses)
         if snapshot is not None:
             self.last_snapshot = snapshot
             self._render_snapshot(snapshot)
@@ -1019,7 +1081,7 @@ class ChatView(Static):
     async def _fetch_news(self, channel: str, range_spec: str) -> None:
         self.chat_area.write(f"[yellow]Fetching news[/]: {channel} {range_spec}")
         ok, result, statuses = await asyncio.to_thread(self.transport.fetch_news, channel, range_spec)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+        self._render_status_panel(statuses)
         if not ok:
             self.chat_area.write(f"[red]News failed[/]: {result}")
             return
@@ -1034,7 +1096,7 @@ class ChatView(Static):
             self.app.call_from_thread(self._update_upload_status, label, percent, stage)
 
         ok, result, statuses = await asyncio.to_thread(self.transport.upload_file, path, progress_cb)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+        self._render_status_panel(statuses)
         if not ok:
             self._clear_upload_status()
             self.chat_area.write(f"[red]Upload failed[/]: {result}")
@@ -1051,12 +1113,26 @@ class ChatView(Static):
             self.app.call_from_thread(self._update_upload_status, label, percent, stage)
 
         ok, result, statuses = await asyncio.to_thread(self.transport.download_file, relative_path, progress_cb)
-        self.status_panel.render_status(self.transport.mode.upper(), statuses, self.transport.last_error)
+        self._render_status_panel(statuses)
         self._clear_upload_status()
         if not ok:
             self.chat_area.write(f"[red]Download failed[/]: {result}")
             return
         self.chat_area.write(f"[green]Downloaded[/]: {name} -> {result}")
+
+    async def _remove_dns_link(self, ip: str) -> None:
+        if self.transport.mode != "dns":
+            self.chat_area.write("[red]DNS remove failed[/]: only available in DNS mode")
+            return
+        state = self.transport.status.get(ip, "unknown")
+        if state != "fail":
+            self.chat_area.write("[yellow]DNS remove skipped[/]: only offline links can be removed")
+            return
+        if not self.transport.remove_dns_link(ip):
+            self.chat_area.write(f"[red]DNS remove failed[/]: {ip} not found")
+            return
+        self.chat_area.write(f"[green]Removed offline DNS link[/]: {ip}")
+        self._render_status_panel(self.transport.status)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -1073,7 +1149,7 @@ class ChatView(Static):
         if text.startswith("/news "):
             parts = text.split(maxsplit=2)
             if len(parts) < 2:
-                self.chat_area.write("[red]News failed[/]: usage /news ChannelName 10 or /news ChannelName 20-10")
+                self.chat_area.write("[red]News failed[/]: usage /news ChannelName 10 or /news ChannelName 20-10 or /news ChannelName 20 10")
                 return
             channel = parts[1].strip()
             range_spec = parts[2].strip() if len(parts) > 2 else "10"
@@ -1092,6 +1168,13 @@ class ChatView(Static):
                 return
             name, relative_path = target
             await self._download_file(name, relative_path)
+            return
+        if text.startswith("/dns-remove "):
+            ip = text.split(" ", 1)[1].strip()
+            if not ip:
+                self.chat_area.write("[red]DNS remove failed[/]: usage /dns-remove <ip>")
+                return
+            await self._remove_dns_link(ip)
             return
         await self._send_text(text)
 

@@ -128,6 +128,7 @@ INCOMING_SOUND_DEBOUNCE_SECONDS = 1.2
 ONLINE_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 ONLINE_PRESENCE_WINDOW_SECONDS = 15 * 60
 ONLINE_FIRST_REFRESH_DELAY_MS = 10 * 1000
+SCANNER_POLL_INTERVAL_MS = 2000
 
 
 class WorkerSignals(QObject):
@@ -364,7 +365,7 @@ class MessageRow(QWidget):
 
 
 class LinkStateRow(QWidget):
-    def __init__(self, label: str, state: str):
+    def __init__(self, label: str, state: str, age_text: str = "", on_remove: Optional[Callable[[], None]] = None):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -378,12 +379,22 @@ class LinkStateRow(QWidget):
             color = "#ef4444"
         dot.setStyleSheet(f"border-radius: 5px; background: {color};")
         text = QLabel(f"{label}")
-        text_state = QLabel(state)
+        text_state = QLabel(age_text or state)
         text_state.setStyleSheet("color: #9ca3af;")
         layout.addWidget(dot)
         layout.addWidget(text)
         layout.addStretch(1)
         layout.addWidget(text_state)
+        if on_remove is not None and state == "fail":
+            remove_btn = QPushButton("x")
+            remove_btn.setFixedSize(22, 22)
+            remove_btn.setStyleSheet(
+                "QPushButton { color: #ef4444; border: 1px solid #7f1d1d; border-radius: 11px; "
+                "background: #1f1010; font-weight: 700; padding: 0px; }"
+                "QPushButton:hover { background: #2f1212; border-color: #ef4444; }"
+            )
+            remove_btn.clicked.connect(on_remove)
+            layout.addWidget(remove_btn)
 
 
 class DateSeparatorRow(QWidget):
@@ -439,7 +450,6 @@ class ChatWindow(QMainWindow):
         self._rendering = False
         self.online_busy = False
         self._online_refresh_started = False
-        self._slipstream_ready = config["mode"] != "dns"
         self.server_online_users: List[str] = []
         self.emoji_picker: Optional[EmojiPickerDialog] = None
         self._last_incoming_sound_at = 0.0
@@ -466,10 +476,9 @@ class ChatWindow(QMainWindow):
         self.poll_timer.start(int(STATUS_POLL_INTERVAL * 1000))
         self.online_timer = QTimer(self)
         self.online_timer.timeout.connect(self._refresh_online_users)
+        self._poll()
         if config["mode"] == "dns":
             self._start_slipstream_clients()
-        else:
-            self._poll()
 
     def _play_outgoing_sound(self) -> None:
         if self._is_shutting_down:
@@ -720,12 +729,61 @@ class ChatWindow(QMainWindow):
         sort_order = {"ok": 0, "unknown": 1, "fail": 2}
         sorted_links = sorted(statuses.items(), key=lambda kv: sort_order.get(kv[1], 1))
         for label, state in sorted_links:
-            row_widget = LinkStateRow(label, state)
+            row_widget = LinkStateRow(
+                label,
+                state,
+                age_text=self._format_link_age(label, state),
+                on_remove=(lambda ip=label: self._remove_dns_link(ip)) if self.transport.mode == "dns" else None,
+            )
             item = QListWidgetItem()
             item.setSizeHint(row_widget.sizeHint())
             self.links_list.addItem(item)
             self.links_list.setItemWidget(item, row_widget)
         self.last_error_label.setText(last_error or "")
+
+    @staticmethod
+    def _format_age_text(seconds: Optional[int]) -> str:
+        if seconds is None:
+            return "never"
+        if seconds < 60:
+            return "now"
+        if seconds < 3600:
+            return f"{seconds // 60}m ago"
+        if seconds < 86400:
+            return f"{seconds // 3600}h ago"
+        return f"{seconds // 86400}d ago"
+
+    def _format_link_age(self, label: str, state: str) -> str:
+        age = self.transport.last_online_age_seconds(label)
+        if state == "unknown" and age is None:
+            return "checking..."
+        return self._format_age_text(age)
+
+    def _remove_dns_link(self, ip: str) -> None:
+        if self.transport.mode != "dns":
+            return
+        state = self.transport.status.get(ip, "unknown")
+        if state != "fail":
+            self._append_system_message("Only offline DNS links can be removed")
+            return
+        old_index = self.transport.dns_ips.index(ip) if ip in self.transport.dns_ips else -1
+        if self.slipstream_manager and 0 <= old_index < len(self.slipstream_manager.processes):
+            proc = self.slipstream_manager.processes.pop(old_index)
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if not self.transport.remove_dns_link(ip):
+            return
+        # Keep config in sync for later operations.
+        self.config["dns_ips"] = list(self.transport.dns_ips)
+        self.config["proxy_ports"] = list(self.transport.proxy_ports)
+        self._append_system_message(f"Removed offline DNS link: {ip}")
+        self._render_status(self.transport.status, self.transport.last_error)
 
     def _render_online_users(self) -> None:
         self.online_list.clear()
@@ -924,7 +982,7 @@ class ChatWindow(QMainWindow):
         )
 
     def _poll(self) -> None:
-        if self._is_shutting_down or not self._slipstream_ready or self.read_busy:
+        if self._is_shutting_down or self.read_busy:
             return
         self.read_busy = True
 
@@ -1057,7 +1115,7 @@ class ChatWindow(QMainWindow):
         if text.startswith("/news "):
             parts = text.split(maxsplit=2)
             if len(parts) < 2:
-                self._append_system_message("News failed: usage /news ChannelName 10 or /news ChannelName 20-10")
+                self._append_system_message("News failed: usage /news ChannelName 10 or /news ChannelName 20-10 or /news ChannelName 20 10")
                 return
             channel = parts[1].strip()
             range_spec = parts[2].strip() if len(parts) > 2 else "10"
@@ -1334,7 +1392,6 @@ class ChatWindow(QMainWindow):
             self._append_system_message(f"Slipstream startup error: {error}")
             return
         log.info("Slipstream ready")
-        self._slipstream_ready = True
         self._poll()
 
     def _shutdown(self) -> None:
@@ -1370,6 +1427,12 @@ class LauncherWindow(QMainWindow):
         self.initial_state = initial_state or {}
         self.state_path = state_path
         self.chat_window: Optional[ChatWindow] = None
+        self.scanner_proc: Optional[subprocess.Popen] = None
+        self._scanner_output_path = APP_STATE_ROOT / "scanner-result.txt"
+        self._scanner_known_ips: set = set()
+        self._scan_finished_at: Optional[float] = None
+        self.scanner_timer = QTimer(self)
+        self.scanner_timer.timeout.connect(self._poll_scanner_result)
         self.setWindowTitle("Chat over DNSTT")
         self.resize(760, 650)
         icon_path = _app_icon_path()
@@ -1528,8 +1591,15 @@ class LauncherWindow(QMainWindow):
         self.dns_remote = self._line("Remote chat.sh path", state.get("remote_script", DEFAULT_REMOTE_SCRIPT))
         self.dns_file_path = self._line("DNS result file", state.get("dns_file_path", self.dns_file))
         self.dns_extra = self._line("Extra DNS IPs (comma-separated)", state.get("dns_extra", ""))
+        self.dns_scan_input = self._line("Scanner input file (optional)", state.get("scanner_input_file", ""))
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self._browse_dns_file)
+        scan_input_browse_btn = QPushButton("Browse")
+        scan_input_browse_btn.clicked.connect(self._browse_scan_input_file)
+        self.scan_btn = QPushButton("Scan")
+        self.scan_btn.clicked.connect(self._start_scan)
+        self.scan_status = QLabel("Not scanned yet")
+        self.scan_status.setObjectName("CardHint")
 
         self.dns_ip_list = QListWidget()
         self.dns_ip_list.setSelectionMode(QListWidget.NoSelection)
@@ -1552,6 +1622,18 @@ class LauncherWindow(QMainWindow):
         form.addWidget(QLabel("DNS file"), row, 0)
         form.addWidget(self.dns_file_path, row, 1)
         form.addWidget(browse_btn, row, 2)
+        row += 1
+        form.addWidget(QLabel("Scan input"), row, 0)
+        form.addWidget(self.dns_scan_input, row, 1)
+        form.addWidget(scan_input_browse_btn, row, 2)
+        row += 1
+        form.addWidget(QLabel("Scanner"), row, 0)
+        scan_row = QHBoxLayout()
+        scan_row.setContentsMargins(0, 0, 0, 0)
+        scan_row.setSpacing(8)
+        scan_row.addWidget(self.scan_btn)
+        scan_row.addWidget(self.scan_status, 1)
+        form.addLayout(scan_row, row, 1, 1, 2)
         row += 1
         form.addWidget(QLabel("DNS IPs"), row, 0, alignment=Qt.AlignTop)
         form.addWidget(self.dns_ip_list, row, 1, 1, 2)
@@ -1579,6 +1661,81 @@ class LauncherWindow(QMainWindow):
         self.dns_extra.clear()
         self._load_dns_ips(path)
 
+    def _browse_scan_input_file(self) -> None:
+        suggested = Path(self.dns_scan_input.text().strip()).expanduser()
+        if suggested.exists():
+            start_dir = suggested.parent if suggested.is_file() else suggested
+        else:
+            desktop = Path.home() / "Desktop"
+            start_dir = desktop if desktop.exists() else Path.home()
+        path = self._pick_file("Select scanner input file", start_dir=start_dir)
+        if not path:
+            return
+        self.dns_scan_input.setText(path)
+
+    def _start_scan(self) -> None:
+        if self.scanner_proc and self.scanner_proc.poll() is None:
+            self.scan_status.setText("Scanning...")
+            return
+        scanner_script = PROJECT_ROOT / "scanner.py"
+        input_file = Path(self.dns_scan_input.text().strip()).expanduser()
+        if not input_file.exists():
+            self._show_error("Scanner input file not found")
+            return
+        if not scanner_script.exists():
+            self._show_error("scanner.py not found in project root")
+            return
+        self._scanner_output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._scanner_output_path.write_text("")
+        self._scanner_known_ips.clear()
+        cmd = [
+            sys.executable,
+            str(scanner_script),
+            "-f",
+            str(input_file),
+            "-o",
+            str(self._scanner_output_path),
+        ]
+        self.scanner_proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._scan_finished_at = None
+        self.scan_status.setText("Scanning...")
+        self.scanner_timer.start(SCANNER_POLL_INTERVAL_MS)
+
+    def _poll_scanner_result(self) -> None:
+        if self._scanner_output_path.exists():
+            entries = parse_dns_result_file(str(self._scanner_output_path))
+            for ip, _stamp in entries:
+                if ip not in self._scanner_known_ips:
+                    self._scanner_known_ips.add(ip)
+            if self._scanner_known_ips:
+                self._load_dns_ips(self.dns_file_path.text())
+        if self.scanner_proc and self.scanner_proc.poll() is None:
+            self.scan_status.setText("Scanning...")
+            return
+        if self.scanner_proc:
+            if self._scan_finished_at is None:
+                self._scan_finished_at = time.time()
+                self.scanner_timer.setInterval(60_000)
+            elapsed = max(0, int(time.time() - self._scan_finished_at))
+            if elapsed < 60:
+                age = "just now"
+            elif elapsed < 3600:
+                age = f"{elapsed // 60}m ago"
+            elif elapsed < 86400:
+                age = f"{elapsed // 3600}h ago"
+            else:
+                age = f"{elapsed // 86400}d ago"
+            self.scan_status.setText(f"Scanned: {age} ({len(self._scanner_known_ips)} found)")
+        else:
+            self.scan_status.setText("Not scanned yet")
+            self.scanner_timer.stop()
+
     def _pick_file(self, title: str, start_dir: Optional[Path] = None) -> str:
         base_dir = (start_dir or (Path.home() / "Desktop")).expanduser()
         if not base_dir.exists() or not base_dir.is_dir():
@@ -1597,12 +1754,19 @@ class LauncherWindow(QMainWindow):
         self.dns_ip_list.clear()
         self.dns_ip_list.clearSelection()
         entries = parse_dns_result_file(path)
-        if not entries:
-            item = QListWidgetItem("(no file - browse or add IPs below)")
+        scanner_entries = parse_dns_result_file(str(self._scanner_output_path))
+        merged: List[Tuple[str, str]] = []
+        seen = set()
+        for ip, stamp in entries + scanner_entries:
+            if ip and ip not in seen:
+                seen.add(ip)
+                merged.append((ip, stamp))
+        if not merged:
+            item = QListWidgetItem("(no file/scan results - browse, scan, or add IPs below)")
             item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
             self.dns_ip_list.addItem(item)
             return
-        for ip, stamp in entries:
+        for ip, stamp in merged:
             label = f"{ip} ({stamp})" if stamp else ip
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, ip)
@@ -1666,6 +1830,7 @@ class LauncherWindow(QMainWindow):
             "name": self.dns_name.text().strip(),
             "remote_script": self.dns_remote.text().strip() or DEFAULT_REMOTE_SCRIPT,
             "dns_file_path": self.dns_file_path.text().strip(),
+            "scanner_input_file": self.dns_scan_input.text().strip(),
             "dns_extra": self.dns_extra.text().strip(),
             "ips": self._selected_dns_ips(),
             "remember_password": self.dns_remember.isChecked(),

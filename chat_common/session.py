@@ -73,6 +73,7 @@ def save_launcher_state(state_path: Path, result: dict) -> None:
             "name": result.get("name", ""),
             "remote_script": result.get("remote_script", DEFAULT_REMOTE_SCRIPT),
             "dns_file_path": result.get("dns_file_path", ""),
+            "scanner_input_file": result.get("scanner_input_file", ""),
             "dns_extra": result.get("dns_extra", ""),
             "remember_password": bool(result.get("remember_password", False)),
         }

@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -113,6 +115,10 @@ class DNSTTScreen(Static):
         self.initial_state = initial_state or {}
         self.dns_file = dns_file or str(Path.home() / "Desktop" / "Projects" / "test-dns" / "result.txt")
         self._loaded_ips = []
+        self.scanner_proc: Optional[subprocess.Popen] = None
+        self.scanner_output_file = APP_STATE_ROOT / "scanner-result.txt"
+        self._scan_timer = None
+        self._scan_finished_at: Optional[float] = None
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -126,8 +132,12 @@ class DNSTTScreen(Static):
             with Horizontal():
                 yield Input(placeholder="DNS file path (result.txt)", id="dns-file-path")
                 yield Button("Browse", id="dns-browse-btn")
+            with Horizontal():
+                yield Input(placeholder="Scanner input file (optional)", id="scan-input")
+                yield Button("Scan", id="scan-btn")
             yield Static("[dim]Select DNS IPs (Space=toggle)[/]:")
             yield SelectionList(id="dns-ip-list")
+            yield Static("Not scanned yet", id="scan-status")
             yield Input(placeholder="Or add DNS IP (comma-separated)", id="dns-extra")
             yield Button("Connect", variant="primary", id="connect-dns-btn")
 
@@ -139,6 +149,8 @@ class DNSTTScreen(Static):
         self.name_input = self.query_one("#name", Input)
         self.remote_script_input = self.query_one("#remote-script", Input)
         self.dns_path_input = self.query_one("#dns-file-path", Input)
+        self.scan_input = self.query_one("#scan-input", Input)
+        self.scan_status = self.query_one("#scan-status", Static)
         self.dns_list = self.query_one("#dns-ip-list", SelectionList)
         self.dns_extra = self.query_one("#dns-extra", Input)
         self.slip_path.value = self.initial_state.get("slip_path", str(Path.home() / "Desktop" / "slipstream-rust"))
@@ -147,7 +159,9 @@ class DNSTTScreen(Static):
         self.name_input.value = self.initial_state.get("name", "")
         self.remote_script_input.value = self.initial_state.get("remote_script", "~/chat-over-dnstt/chat.sh")
         self.dns_path_input.value = self.initial_state.get("dns_file_path", self.dns_file)
+        self.scan_input.value = self.initial_state.get("scanner_input_file", "")
         self.dns_extra.value = self.initial_state.get("dns_extra", "")
+        self._scan_timer = self.set_interval(2, self._poll_scan_result, pause=True)
         self._load_dns()
     def _load_dns(self):
         path = Path(self.dns_path_input.value.strip()).expanduser()
@@ -155,17 +169,31 @@ class DNSTTScreen(Static):
         if hasattr(self.dns_list, "deselect_all"):
             self.dns_list.deselect_all()
         self._loaded_ips = []
+        entries = []
         if path.exists():
             for line in path.read_text().splitlines():
                 if "IP:" in line and "Time:" in line:
                     parts = line.split("IP:")[1].strip().split("-")
                     ip = parts[0].strip()
                     t = parts[1].replace("Time:", "").strip() if len(parts) > 1 else ""
-                    if ip and ip not in self._loaded_ips:
-                        self._loaded_ips.append(ip)
-                        self.dns_list.add_option((f"{ip}  ({t})", ip, True))
+                    if ip:
+                        entries.append((ip, t))
+        if self.scanner_output_file.exists():
+            for line in self.scanner_output_file.read_text().splitlines():
+                if "IP:" in line and "Time:" in line:
+                    parts = line.split("IP:")[1].strip().split("-")
+                    ip = parts[0].strip()
+                    t = parts[1].replace("Time:", "").strip() if len(parts) > 1 else ""
+                    if ip:
+                        entries.append((ip, t))
+        seen = set()
+        for ip, t in entries:
+            if ip and ip not in seen:
+                seen.add(ip)
+                self._loaded_ips.append(ip)
+                self.dns_list.add_option((f"{ip}  ({t})", ip, True))
         if not self._loaded_ips:
-            self.dns_list.add_option(("(no file - browse or add IPs below)", ""))
+            self.dns_list.add_option(("(no file/scan results - browse, scan, or add IPs below)", ""))
 
     def _on_file_picked(self, path: Optional[Path]) -> None:
         if path:
@@ -182,6 +210,66 @@ class DNSTTScreen(Static):
             picker = FilePickerScreen(start_path=start)
             result = await self.app.push_screen_wait(picker)
             self._on_file_picked(result)
+        elif event.button.id == "scan-btn":
+            self._start_scan()
+
+    def _start_scan(self) -> None:
+        if self.scanner_proc and self.scanner_proc.poll() is None:
+            self.scan_status.update("[yellow]Scanning...[/]")
+            return
+        scanner_script = PROJECT_ROOT / "scanner.py"
+        input_file = Path(self.scan_input.value.strip()).expanduser()
+        if not input_file.exists():
+            self.notify("Scanner input file not found", severity="error")
+            return
+        if not scanner_script.exists():
+            self.notify("scanner.py not found", severity="error")
+            return
+        self.scanner_output_file.parent.mkdir(parents=True, exist_ok=True)
+        self.scanner_output_file.write_text("")
+        cmd = [
+            sys.executable,
+            str(scanner_script),
+            "-f",
+            str(input_file),
+            "-o",
+            str(self.scanner_output_file),
+        ]
+        self.scanner_proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._scan_finished_at = None
+        self.scan_status.update("[yellow]Scanning...[/]")
+        if self._scan_timer:
+            self._scan_timer.resume()
+
+    def _poll_scan_result(self) -> None:
+        if self.scanner_output_file.exists():
+            self._load_dns()
+        if self.scanner_proc and self.scanner_proc.poll() is None:
+            self.scan_status.update("[yellow]Scanning...[/]")
+            return
+        if self.scanner_proc:
+            if self._scan_finished_at is None:
+                self._scan_finished_at = time.time()
+            elapsed = max(0, int(time.time() - self._scan_finished_at))
+            if elapsed < 60:
+                age = "just now"
+            elif elapsed < 3600:
+                age = f"{elapsed // 60}m ago"
+            elif elapsed < 86400:
+                age = f"{elapsed // 3600}h ago"
+            else:
+                age = f"{elapsed // 86400}d ago"
+            self.scan_status.update(f"[green]Scanned:[/] {age}")
+        else:
+            self.scan_status.update("[dim]Not scanned yet[/]")
+            if self._scan_timer:
+                self._scan_timer.pause()
 
     def get_selected_ips(self):
         ips = list(self.dns_list.selected)
@@ -204,6 +292,7 @@ class DNSTTScreen(Static):
             "name": self.name_input.value.strip(),
             "remote_script": self.remote_script_input.value.strip() or "~/chat-over-dnstt/chat.sh",
             "dns_file_path": self.dns_path_input.value.strip(),
+            "scanner_input_file": self.scan_input.value.strip(),
             "dns_extra": self.dns_extra.value.strip(),
             "ips": self.get_selected_ips(),
         }
@@ -444,6 +533,7 @@ def save_launcher_state(state_path: Path, result: dict) -> None:
             "name": result.get("name", ""),
             "remote_script": result.get("remote_script", "~/chat-over-dnstt/chat.sh"),
             "dns_file_path": result.get("dns_file_path", ""),
+            "scanner_input_file": result.get("scanner_input_file", ""),
             "dns_extra": result.get("dns_extra", ""),
         }
     state_path.write_text(json.dumps(state, indent=2))

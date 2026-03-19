@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -61,9 +62,11 @@ class ChatTransport:
         if mode == "dns":
             self.status = {ip: "unknown" for ip in self.dns_ips}
             self.fail_counts = {ip: 0 for ip in self.dns_ips}
+            self.last_online_at = {ip: None for ip in self.dns_ips}
         else:
             self.status = {"ssh": "unknown"}
             self.fail_counts = {"ssh": 0}
+            self.last_online_at = {"ssh": None}
         self.last_error = ""
 
     def _normalize_remote_script(self, path: str) -> str:
@@ -271,6 +274,7 @@ class ChatTransport:
     def _mark_success(self, label: str) -> None:
         self.status[label] = "ok"
         self.fail_counts[label] = 0
+        self.last_online_at[label] = datetime.now(timezone.utc)
 
     def _mark_failure(self, label: str, error: str) -> None:
         self.fail_counts[label] = self.fail_counts.get(label, 0) + 1
@@ -283,6 +287,41 @@ class ChatTransport:
                 self.status[label] = "fail"
         else:
             self.status[label] = "fail"
+
+    def remove_dns_link(self, label: str) -> bool:
+        """Remove one DNS link from runtime state (UI-only delete)."""
+        if self.mode != "dns":
+            return False
+        if label not in self.dns_ips:
+            return False
+        idx = self.dns_ips.index(label)
+        self.dns_ips.pop(idx)
+        if idx < len(self.proxy_ports):
+            self.proxy_ports.pop(idx)
+        self.status.pop(label, None)
+        self.fail_counts.pop(label, None)
+        self.last_online_at.pop(label, None)
+        return True
+
+    def last_online_age_seconds(self, label: str, now: Optional[datetime] = None) -> Optional[int]:
+        when = self.last_online_at.get(label)
+        if when is None:
+            return None
+        if now is None:
+            now = datetime.now(timezone.utc)
+        return max(0, int((now - when).total_seconds()))
+
+    @staticmethod
+    def normalize_news_range(range_spec: str) -> str:
+        """Accept '10', '20-10' and '20 10' forms."""
+        value = (range_spec or "").strip()
+        if not value:
+            return "10"
+        if " " in value and "-" not in value:
+            parts = [p for p in value.split() if p]
+            if len(parts) == 2 and all(p.isdigit() for p in parts):
+                return f"{parts[0]}-{parts[1]}"
+        return value
 
     def read_messages(self, limit: int = 200) -> Tuple[Optional[str], Dict[str, str]]:
         if self.mode == "ssh":
@@ -391,7 +430,8 @@ class ChatTransport:
         return False, "clear failed"
 
     def fetch_news(self, channel: str, range_spec: str) -> Tuple[bool, str, Dict[str, str]]:
-        remote_command = f"bash {self.remote_script} -g {shlex.quote(channel)} {shlex.quote(range_spec)}"
+        normalized_range = self.normalize_news_range(range_spec)
+        remote_command = f"bash {self.remote_script} -g {shlex.quote(channel)} {shlex.quote(normalized_range)}"
 
         if self.mode == "ssh":
             try:
