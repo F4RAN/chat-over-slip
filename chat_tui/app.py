@@ -719,32 +719,34 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Return a Rich Text, converting RTL text to visual order.
+        """Return right-justified Text, hard-wrapped to fit inside the panel.
 
-        Terminal bidi algorithms reorder RTL characters across the full
-        terminal line, ignoring Rich Panel boundaries.  We convert to
-        visual display order with python-bidi and wrap with LRO/PDF so
-        the terminal renders characters exactly as placed by Rich,
-        keeping text inside the panel.
+        The terminal's bidi algorithm reorders RTL characters across the full
+        terminal line width, so no matter how Rich clips the text the terminal
+        may place glyphs outside the panel border.  The only reliable fix is
+        to ensure no logical line is wider than the available panel content
+        area *before* the terminal sees it.
         """
         if not text:
             return Text.from_markup("")
         if not self._has_rtl(text):
             return Text.from_markup(text)
+        import textwrap
+        # Panel uses 2 border chars + padding=(0,1) → 4 cols overhead.
+        # Fall back to a safe default if the widget isn't laid out yet.
         try:
-            from bidi.algorithm import get_display
-            plain = Text.from_markup(text)
-            # Convert each line to visual order independently.
-            lines = plain.plain.split("\n")
-            visual_lines = [get_display(line) for line in lines]
-            visual = "\n".join(visual_lines)
-            # Wrap with LRO/PDF to prevent bidi-aware terminals from
-            # double-reversing the already-visual-order text.
-            t = Text("\u202D" + visual + "\u202C")
-            t.justify = "right"
-            return t
-        except ImportError:
-            return Text.from_markup(text)
+            max_w = max(20, self.chat_area.content_size.width - 4)
+        except Exception:
+            max_w = 72
+        plain = Text.from_markup(text).plain
+        # Wrap each paragraph independently so existing newlines are kept.
+        paragraphs = plain.split("\n")
+        wrapped_lines = []
+        for para in paragraphs:
+            wrapped_lines.append(textwrap.fill(para, width=max_w) if para.strip() else "")
+        t = Text("\n".join(wrapped_lines))
+        t.justify = "right"
+        return t
 
     def _play_notification_sound(self) -> None:
         def _run() -> None:
