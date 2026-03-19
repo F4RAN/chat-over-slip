@@ -46,7 +46,7 @@ SOFT_ERROR_OK_GRACE_FAILURES = 3
 SOFT_ERROR_UNKNOWN_GRACE_FAILURES = 1
 SSH_SEND_RETRIES = 3
 SSH_SEND_RETRY_DELAY = 2
-DNS_LINK_MAX_RETRIES = 2
+DNS_LINK_MAX_RETRIES = 1
 APP_RUNTIME_ROOT = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
