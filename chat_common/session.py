@@ -416,7 +416,7 @@ class ChatSessionModel:
         return active
 
     def should_retry_pending(self, mode: str, snapshot: Optional[str]) -> bool:
-        return bool(snapshot is not None and self.pending_messages)
+        return bool(snapshot is not None and self.pending_messages and mode == "ssh")
 
     def update_upload_status(self, label: str, percent: Optional[int], stage: str) -> str:
         if stage == "done":

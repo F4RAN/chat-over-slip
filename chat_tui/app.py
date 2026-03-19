@@ -1188,8 +1188,12 @@ class ChatView(Static):
                 if snapshot is not None and snapshot != self.last_snapshot:
                     self.last_snapshot = snapshot
                     self._render_snapshot(snapshot)
-                # When back online, retry one pending message per poll
-                if snapshot is not None and self.pending_messages:
+                # When SSH is back online, retry one pending message per poll
+                if (
+                    snapshot is not None
+                    and self.pending_messages
+                    and self.transport.mode == "ssh"
+                ):
                     await self._retry_one_pending()
             except Exception as exc:
                 self.transport.last_error = str(exc)
@@ -1287,8 +1291,8 @@ class ChatView(Static):
         asyncio.create_task(self._send_text_background(text))
 
     async def _retry_one_pending(self) -> None:
-        """Send the oldest pending message once. Used when back online."""
-        if not self.pending_messages:
+        """Send the oldest pending message once (SSH mode). Used when back online."""
+        if not self.pending_messages or self.transport.mode != "ssh":
             return
         user, text = self.pending_messages[0]
         preview = text if len(text) <= 30 else text[:27] + "..."
