@@ -476,24 +476,37 @@ class SlipstreamManager:
         self.proxy_ports = proxy_ports
         self.processes: List[subprocess.Popen] = []
 
-    def _kill_stale_listeners(self) -> None:
-        """Kill any leftover slipstream-client processes occupying our ports."""
-        for port in self.proxy_ports:
+    def _free_port(self, port: int) -> None:
+        """Kill every process listening on *port* and wait until it is free."""
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f"tcp:{port}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (subprocess.CalledProcessError, OSError):
+            return  # nothing on this port
+        for pid_str in out.split():
             try:
-                out = subprocess.check_output(
+                pid = int(pid_str)
+                if pid != os.getpid():
+                    os.kill(pid, signal.SIGKILL)
+            except (ValueError, OSError):
+                pass
+        # wait up to 2s for the port to actually become free
+        for _ in range(20):
+            try:
+                subprocess.check_output(
                     ["lsof", "-ti", f"tcp:{port}"],
                     stderr=subprocess.DEVNULL,
-                    text=True,
                 )
-                for pid_str in out.split():
-                    pid = int(pid_str)
-                    if pid != os.getpid():
-                        os.kill(pid, signal.SIGKILL)
-            except (subprocess.CalledProcessError, ValueError, OSError):
-                pass
+                time.sleep(0.1)
+            except subprocess.CalledProcessError:
+                return  # port is free
 
     def start(self, on_status=None) -> None:
-        self._kill_stale_listeners()
+        for port in self.proxy_ports:
+            self._free_port(port)
         for ip, port in zip(self.dns_ips, self.proxy_ports):
             if on_status:
                 on_status(f"Starting DNS link: {ip}")
