@@ -29,7 +29,7 @@ from rich.rule import Rule
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual import events
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
@@ -744,7 +744,6 @@ class ChatView(Static):
         padding: 1;
         border: solid $primary;
         background: $surface-darken-1;
-        layout: vertical;
     }
     #status {
         height: auto;
@@ -756,7 +755,7 @@ class ChatView(Static):
     }
     .dns-x-btn {
         height: 1;
-        min-width: 8;
+        min-width: 6;
         width: auto;
         margin: 0;
         padding: 0;
@@ -769,14 +768,12 @@ class ChatView(Static):
         background: red;
     }
     #scan-btn {
-        height: 1;
+        height: 3;
         min-width: 10;
         width: auto;
         margin: 1 0 0 0;
-        padding: 0;
         background: darkcyan;
         color: white;
-        border: none;
     }
     #scan-btn:hover {
         background: cyan;
@@ -1026,7 +1023,7 @@ class ChatView(Static):
 
     def compose(self) -> ComposeResult:
         with Container(id="main"):
-            with Vertical(id="sidebar"):
+            with VerticalScroll(id="sidebar"):
                 yield StatusPanel(id="status")
                 yield Vertical(id="dns-btns")
                 yield Button("Scan", id="scan-btn")
@@ -1073,10 +1070,13 @@ class ChatView(Static):
         failed = {ip for ip, state in statuses.items() if state == "fail"}
         if failed == self._last_failed_ips:
             return
-        self._last_failed_ips = failed
-        self.dns_btns_container.remove_children()
+        self._last_failed_ips = set(failed)
+        # Remove existing x buttons
+        for child in list(self.dns_btns_container.children):
+            child.remove()
+        # Add new x buttons (no id= to avoid duplicates)
         for ip in sorted(failed):
-            btn = Button(f"[x] {ip}", id=f"dns-x-{ip.replace('.', '_')}", classes="dns-x-btn")
+            btn = Button(f"[x] {ip}", classes="dns-x-btn")
             btn.dns_ip = ip
             self.dns_btns_container.mount(btn)
 
