@@ -718,10 +718,13 @@ class ChatView(Static):
                 return True
         return False
 
-    def _rtl_wrap(self, text: str) -> str:
+    def _rtl_wrap(self, text: str) -> Text:
+        """Wrap RTL text using Rich Text with right-justify to avoid bidi marker leaks."""
         if not text or not self._has_rtl(text):
-            return text
-        return "\u2067" + text + "\u2069"
+            return Text.from_markup(text)
+        t = Text.from_markup(text)
+        t.justify = "right"
+        return t
 
     def _play_notification_sound(self) -> None:
         def _run() -> None:
@@ -742,11 +745,12 @@ class ChatView(Static):
 
     def _append_local_line(self, user: str, text: str, pending: bool = False) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        suffix = " [yellow](pending)[/yellow]" if pending else ""
         display_text, _ = self._parse_file_message(text)
-        body = self._rtl_wrap(display_text) + suffix
+        body = self._rtl_wrap(display_text)
+        if pending:
+            body.append(" (pending)", style="yellow")
         header = f"[dim]{now}[/] [bold]{user}[/]"
-        self.chat_area.write(Panel(Group(Text.from_markup(header), Text.from_markup(body)), padding=(0, 1), border_style="dim", box=box.ROUNDED))
+        self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
 
     def write_system(self, text: str, style: str = "dim") -> None:
         self.chat_area.write(f"[{style}]{text}[/{style}]")
@@ -836,7 +840,7 @@ class ChatView(Static):
                     display_text, file_entry = self._parse_file_message(text)
                     body = self._rtl_wrap(display_text)
                     header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    self.chat_area.write(Panel(Group(Text.from_markup(header), Text.from_markup(body)), padding=(0, 1), border_style="dim", box=box.ROUNDED))
+                    self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
