@@ -182,6 +182,7 @@ class ChatTransport:
             "connection reset by peer",
             "connection reset",
             "read: connection reset",
+            "permission denied",
         ]
         return any(marker in text for marker in soft_markers)
 
