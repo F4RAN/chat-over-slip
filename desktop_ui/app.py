@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import html
+import logging
+import logging.handlers
+import os
 import shutil
 import subprocess
 import sys
@@ -72,10 +75,27 @@ from chat_common.transport import ChatTransport, STATUS_POLL_INTERVAL
 CRASH_LOG_PATH = Path.home() / ".chat-over-dnstt" / "crash.log"
 
 
+log = logging.getLogger("chat_gui")
+
+
 def _setup_crash_logging() -> None:
-    """Enable faulthandler (SIGSEGV/SIGABRT tracebacks) and excepthook logging."""
+    """Enable faulthandler (SIGSEGV/SIGABRT tracebacks), excepthook and rich file logging."""
     log_dir = CRASH_LOG_PATH.parent
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- rich file logger (always-on, for diagnosing non-fatal issues) ----
+    _log_file = log_dir / "gui.log"
+    file_handler = logging.handlers.RotatingFileHandler(
+        _log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s [%(funcName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    log.addHandler(file_handler)
+    log.setLevel(logging.DEBUG)
+    log.info("=== App start (PID %d) ===", os.getpid())
+
     try:
         f = open(CRASH_LOG_PATH, "a", encoding="utf-8")
         f.write(
@@ -87,6 +107,7 @@ def _setup_crash_logging() -> None:
         _orig_excepthook = sys.excepthook
 
         def _excepthook(etype, value, tb):
+            log.critical("Uncaught exception", exc_info=(etype, value, tb))
             f.write(f"\n--- {datetime.now().isoformat()} --- Uncaught exception ---\n")
             traceback.print_exception(etype, value, tb, file=f)
             f.flush()
@@ -114,9 +135,10 @@ class WorkerSignals(QObject):
 
 
 class FunctionWorker(QRunnable):
-    def __init__(self, fn: Callable):
+    def __init__(self, fn: Callable, label: str = ""):
         super().__init__()
         self.fn = fn
+        self.label = label or getattr(fn, "__name__", "?")
         self.signals = WorkerSignals()
         self._cancelled = False
 
@@ -129,6 +151,7 @@ class FunctionWorker(QRunnable):
             if not self._cancelled:
                 self.signals.finished.emit(result, None)
         except Exception as exc:
+            log.exception("Worker [%s] crashed", self.label)
             if not self._cancelled:
                 self.signals.finished.emit(None, exc)
 
@@ -658,7 +681,8 @@ class ChatWindow(QMainWindow):
         kind, fn, callback = self._transport_queue.pop(0)
         self._transport_busy = True
         self._active_transport_kind = kind
-        worker = FunctionWorker(fn)
+        log.debug("Transport task starting: %s", kind)
+        worker = FunctionWorker(fn, label=kind)
         self._active_worker = worker
 
         def _finished(result, error) -> None:
@@ -667,7 +691,14 @@ class ChatWindow(QMainWindow):
             self._active_transport_kind = ""
             if self._is_shutting_down:
                 return
-            callback(result, error)
+            try:
+                callback(result, error)
+            except Exception:
+                log.exception("Crash in transport callback [%s]", kind)
+                try:
+                    self._append_system_message(f"Internal error in {kind} – see gui.log")
+                except Exception:
+                    pass
             self._pump_transport_queue()
 
         worker.signals.finished.connect(_finished)
@@ -908,10 +939,15 @@ class ChatWindow(QMainWindow):
         if self._is_shutting_down:
             return
         if error:
+            log.warning("Poll error: %s", error)
             self.transport.last_error = str(error)
             self._render_status(self.transport.status, self.transport.last_error)
             return
+        if not isinstance(result, (tuple, list)) or len(result) < 2:
+            log.error("Poll returned unexpected result: %r", result)
+            return
         snapshot, statuses = result
+        log.debug("Poll ok, snapshot=%s, statuses=%s", snapshot is not None, statuses)
         self._render_status(statuses, self.transport.last_error)
         if snapshot is not None and not self._online_refresh_started:
             self._online_refresh_started = True
@@ -944,7 +980,10 @@ class ChatWindow(QMainWindow):
 
     def _on_online_users_finished(self, result, error) -> None:
         self.online_busy = False
-        if self._is_shutting_down or error:
+        if self._is_shutting_down:
+            return
+        if error:
+            log.warning("Online-users error: %s", error)
             return
         self.server_online_users = result or []
         self._render_online_users()
@@ -967,10 +1006,15 @@ class ChatWindow(QMainWindow):
         if self._is_shutting_down:
             return
         if error:
+            log.warning("Retry-send error: %s", error)
             self.transport.last_error = str(error)
             self._render_status(self.transport.status, self.transport.last_error)
             return
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            log.error("Retry-send returned unexpected result: %r", result)
+            return
         ok, _err, statuses = result
+        log.debug("Retry-send ok=%s", ok)
         self._render_status(statuses, self.transport.last_error)
         if not ok:
             return
@@ -1051,9 +1095,15 @@ class ChatWindow(QMainWindow):
         if self._is_shutting_down:
             return
         if error:
+            log.warning("Send error: %s", error)
             self._append_system_message(f"Send failed: {error}")
             return
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            log.error("Send returned unexpected result: %r", result)
+            self._append_system_message("Send failed: unexpected transport response")
+            return
         ok, err, statuses = result
+        log.debug("Send ok=%s err=%s", ok, err)
         self._render_status(statuses, self.transport.last_error)
         if not ok:
             self._append_system_message(f"Send failed: {err or 'no working link'}")
@@ -1069,7 +1119,12 @@ class ChatWindow(QMainWindow):
         if self._is_shutting_down:
             return
         if error:
+            log.warning("Clear error: %s", error)
             self._append_system_message(f"Clear failed: {error}")
+            return
+        if not isinstance(result, (tuple, list)) or len(result) < 2:
+            log.error("Clear returned unexpected result: %r", result)
+            self._append_system_message("Clear failed: unexpected response")
             return
         ok, err = result
         if ok:
@@ -1091,7 +1146,12 @@ class ChatWindow(QMainWindow):
         if self._is_shutting_down:
             return
         if error:
+            log.warning("News error: %s", error)
             self._append_system_message(f"News failed: {error}")
+            return
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            log.error("News returned unexpected result: %r", result)
+            self._append_system_message("News failed: unexpected response")
             return
         ok, output, statuses = result
         self._render_status(statuses, self.transport.last_error)
@@ -1143,7 +1203,12 @@ class ChatWindow(QMainWindow):
         self.transfer_label.setText(self.session.clear_upload_status())
         self.transfer_bar.hide()
         if error:
+            log.warning("Upload error: %s", error)
             self._append_system_message(f"Upload failed: {error}")
+            return
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            log.error("Upload returned unexpected result: %r", result)
+            self._append_system_message("Upload failed: unexpected response")
             return
         ok, output, statuses = result
         self._render_status(statuses, self.transport.last_error)
@@ -1182,7 +1247,12 @@ class ChatWindow(QMainWindow):
         self.transfer_label.setText(self.session.clear_upload_status())
         self.transfer_bar.hide()
         if error:
+            log.warning("Download error: %s", error)
             self._append_system_message(f"Download failed: {error}")
+            return
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            log.error("Download returned unexpected result: %r", result)
+            self._append_system_message("Download failed: unexpected response")
             return
         ok, output, statuses = result
         self._render_status(statuses, self.transport.last_error)
@@ -1260,12 +1330,15 @@ class ChatWindow(QMainWindow):
 
     def _on_slipstream_started(self, error) -> None:
         if error:
+            log.error("Slipstream startup error: %s", error)
             self._append_system_message(f"Slipstream startup error: {error}")
             return
+        log.info("Slipstream ready")
         self._slipstream_ready = True
         self._poll()
 
     def _shutdown(self) -> None:
+        log.info("Shutdown started")
         self._is_shutting_down = True
         self._transport_queue.clear()
         if hasattr(self, "poll_timer") and self.poll_timer:
@@ -1276,9 +1349,12 @@ class ChatWindow(QMainWindow):
             self._active_worker.cancel()
         if getattr(self, "_slip_worker", None):
             self._slip_worker.cancel()
+        log.info("Waiting for thread pool (5s timeout)")
         self.thread_pool.waitForDone(5000)
         if self.slipstream_manager:
+            log.info("Stopping slipstream processes")
             self.slipstream_manager.stop()
+        log.info("Shutdown complete")
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._shutdown()
