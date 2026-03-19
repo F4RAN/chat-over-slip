@@ -743,6 +743,34 @@ class ChatView(Static):
         height: 1fr;
         layout: horizontal;
     }
+    #chat-column {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+    }
+    #filter-bar {
+        height: 3;
+        width: 100%;
+        padding: 0 1;
+        dock: top;
+    }
+    .filter-btn {
+        min-width: 10;
+        height: 3;
+        margin: 0 1 0 0;
+        background: $surface-darken-1;
+        color: $text-muted;
+        border: tall $primary-darken-2;
+    }
+    .filter-btn:hover {
+        background: $primary-darken-1;
+        color: $text;
+    }
+    .filter-active {
+        background: $primary;
+        color: $text;
+        border: tall $primary;
+    }
     #chat-area {
         width: 1fr;
         height: 1fr;
@@ -844,6 +872,7 @@ class ChatView(Static):
         self._scan_finished_at: Optional[float] = None
         self._scan_timer = None
         self._on_new_dns_ip = on_new_dns_ip
+        self._message_filter_mode = "all"
 
     def _has_rtl(self, text: str) -> bool:
         for c in (text or ""):
@@ -1054,7 +1083,12 @@ class ChatView(Static):
                 yield Static("", id="error-text")
                 yield Button("Scan", id="scan-btn")
                 yield Static("", id="scan-status")
-            yield RichLog(id="chat-area", wrap=True, markup=True)
+            with Vertical(id="chat-column"):
+                with Horizontal(id="filter-bar"):
+                    yield Button("All", id="filter-all", classes="filter-btn filter-active")
+                    yield Button("News", id="filter-news", classes="filter-btn")
+                    yield Button("Messages", id="filter-messages", classes="filter-btn")
+                yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
             yield UploadInput(placeholder="Type message. Commands: /clear /upload /download /news", id="msg-input")
@@ -1124,6 +1158,16 @@ class ChatView(Static):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "scan-btn":
             self._start_scan()
+        elif event.button.id in ("filter-all", "filter-news", "filter-messages"):
+            self._set_message_filter(event.button.id.replace("filter-", ""))
+
+    def _set_message_filter(self, mode: str) -> None:
+        self._message_filter_mode = mode
+        for btn_id, btn_mode in (("filter-all", "all"), ("filter-news", "news"), ("filter-messages", "messages")):
+            btn = self.query_one(f"#{btn_id}", Button)
+            btn.set_classes("filter-btn filter-active" if btn_mode == mode else "filter-btn")
+        if self.last_snapshot:
+            self._render_snapshot(self.last_snapshot)
 
     async def refresh_now(self) -> None:
         try:
@@ -1156,6 +1200,14 @@ class ChatView(Static):
                 self._render_status_panel(self.transport.status)
             await asyncio.sleep(STATUS_POLL_INTERVAL)
 
+    def _should_show_message(self, user: str) -> bool:
+        if self._message_filter_mode == "all":
+            return True
+        is_news = user.startswith("news/")
+        if self._message_filter_mode == "news":
+            return is_news
+        return not is_news  # "messages" mode
+
     def _render_snapshot(self, snapshot: str) -> None:
         self.chat_area.clear()
         available_files: Dict[str, str] = {}
@@ -1170,8 +1222,9 @@ class ChatView(Static):
                         should_play = True
                     self.seen_msg_ids.add(msg_id)
                     display_text, file_entry = self._parse_file_message(text)
-                    header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    self._write_message(header, display_text)
+                    if self._should_show_message(user):
+                        header = f"[dim]{ts}[/] [bold]{user}[/]"
+                        self._write_message(header, display_text)
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
