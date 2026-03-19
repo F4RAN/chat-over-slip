@@ -679,6 +679,7 @@ class ChatView(Static):
         height: 1fr;
         padding: 1 2;
         border: solid $primary;
+        overflow-x: hidden;
     }
     #status {
         width: 28;
@@ -719,10 +720,20 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Wrap RTL text using Rich Text with right-justify to avoid bidi marker leaks."""
+        """Wrap RTL text safely to prevent terminal bidi from breaking TUI layout.
+
+        Inserts LRM (Left-to-Right Mark) at the start and after each newline so
+        the terminal's bidi algorithm keeps paragraph direction as LTR.  This
+        keeps Panel borders and the sidebar in place while RTL text still renders
+        correctly within its runs.
+        """
         if not text or not self._has_rtl(text):
             return Text.from_markup(text)
-        t = Text.from_markup(text)
+        # Anchor every line as LTR-paragraph so terminal bidi won't reorder
+        # panel borders or bleed into adjacent widgets.
+        lrm = "\u200E"
+        anchored = lrm + text.replace("\n", "\n" + lrm)
+        t = Text.from_markup(anchored)
         t.justify = "right"
         return t
 
