@@ -386,7 +386,7 @@ class ChatTransport:
         errors = []
         executor = ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports)))
         futures = [
-            executor.submit(self._run_link_command, ip, port, remote_command, None)
+            executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
             for ip, port in zip(self.dns_ips, self.proxy_ports)
         ]
         try:

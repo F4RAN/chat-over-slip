@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import importlib
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -475,7 +476,24 @@ class SlipstreamManager:
         self.proxy_ports = proxy_ports
         self.processes: List[subprocess.Popen] = []
 
+    def _kill_stale_listeners(self) -> None:
+        """Kill any leftover slipstream-client processes occupying our ports."""
+        for port in self.proxy_ports:
+            try:
+                out = subprocess.check_output(
+                    ["lsof", "-ti", f"tcp:{port}"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                for pid_str in out.split():
+                    pid = int(pid_str)
+                    if pid != os.getpid():
+                        os.kill(pid, signal.SIGKILL)
+            except (subprocess.CalledProcessError, ValueError, OSError):
+                pass
+
     def start(self, on_status=None) -> None:
+        self._kill_stale_listeners()
         for ip, port in zip(self.dns_ips, self.proxy_ports):
             if on_status:
                 on_status(f"Starting DNS link: {ip}")
