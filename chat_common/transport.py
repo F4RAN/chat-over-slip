@@ -282,8 +282,6 @@ class ChatTransport:
     def _mark_success(self, label: str) -> None:
         if self._is_removed(label):
             return
-        if self.retry_counts.get(label, 0) >= DNS_LINK_MAX_RETRIES:
-            return  # permanently failed, ignore stale success
         self.status[label] = "ok"
         self.fail_counts[label] = 0
         self.retry_counts[label] = 0
