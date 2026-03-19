@@ -719,23 +719,19 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Return visually-ordered RTL text that stays inside the panel.
+        """Return right-justified Text with LRM anchors to stay inside the panel.
 
-        Strategy: convert RTL text to visual order with python-bidi, then
-        wrap each line in LRO (Left-to-Right Override) + PDF (Pop Directional
-        Format).  LRO forces the terminal to treat ALL characters as LTR,
-        preventing the bidi algorithm from re-reversing the already visual-
-        order text.  This keeps content inside the panel AND preserves correct
-        RTL reading order.
+        Prepend U+200E LEFT-TO-RIGHT MARK at the start of every wrapped line.
+        The terminal sees LRM as the first strong character → LTR paragraph
+        direction → content stays inside the panel instead of overflowing
+        to the right edge of the terminal.
         """
         if not text:
             return Text.from_markup("")
         if not self._has_rtl(text):
             return Text.from_markup(text)
         import textwrap
-        from bidi.algorithm import get_display
-        LRO = "\u202D"   # Left-to-Right Override
-        PDF = "\u202C"   # Pop Directional Formatting
+        LRM = "\u200E"
         # Compute available width from terminal width minus all overhead:
         # status panel (28) + chat border (2) + chat padding (4) +
         # panel border (2) + panel padding (2) + scrollbar (2) = 40
@@ -749,10 +745,7 @@ class ChatView(Static):
             if para.strip():
                 filled = textwrap.fill(para, width=max_w)
                 for line in filled.split("\n"):
-                    # Convert to visual order, then lock LTR so terminal
-                    # doesn't re-reverse the RTL character runs.
-                    visual = get_display(line)
-                    result_lines.append(LRO + visual + PDF)
+                    result_lines.append(LRM + line)
             else:
                 result_lines.append("")
         t = Text("\n".join(result_lines))
