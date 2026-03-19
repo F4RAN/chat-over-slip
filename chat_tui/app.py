@@ -750,6 +750,10 @@ class DNSLinkLabel(Static):
 
 
 class UploadInput(Input):
+    # Max path length to even attempt a stat() call – avoids OSError on
+    # normal chat text and skips the syscall entirely for regular messages.
+    _MAX_PATH_LEN = 260
+
     def _extract_file_path(self, text: str) -> Optional[str]:
         line = text.strip()
         if not line:
@@ -758,8 +762,19 @@ class UploadInput(Input):
         if line.startswith("file://"):
             parsed = urlparse(line)
             candidate = unquote(parsed.path)
-            if candidate and Path(candidate).expanduser().is_file():
-                return candidate
+            if not candidate or len(candidate) > self._MAX_PATH_LEN:
+                return None
+            try:
+                if Path(candidate).expanduser().is_file():
+                    return candidate
+            except OSError:
+                pass
+            return None
+
+        # Quick reject: anything that looks like a chat message or command
+        # rather than a file path.  Avoids shlex + stat on every keystroke.
+        if line.startswith("/") or len(line) > self._MAX_PATH_LEN:
+            return None
 
         try:
             parts = shlex.split(line)
@@ -770,8 +785,13 @@ class UploadInput(Input):
             return None
 
         candidate = str(Path(parts[0]).expanduser())
-        if Path(candidate).is_file():
-            return candidate
+        if len(candidate) > self._MAX_PATH_LEN:
+            return None
+        try:
+            if Path(candidate).is_file():
+                return candidate
+        except OSError:
+            pass
         return None
 
     def as_upload_command(self, text: str) -> Optional[str]:
