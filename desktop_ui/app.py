@@ -118,13 +118,19 @@ class FunctionWorker(QRunnable):
         super().__init__()
         self.fn = fn
         self.signals = WorkerSignals()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
 
     def run(self) -> None:
         try:
             result = self.fn()
-            self.signals.finished.emit(result, None)
+            if not self._cancelled:
+                self.signals.finished.emit(result, None)
         except Exception as exc:
-            self.signals.finished.emit(None, exc)
+            if not self._cancelled:
+                self.signals.finished.emit(None, exc)
 
 
 def _configure_fonts(app: QApplication) -> None:
@@ -418,6 +424,7 @@ class ChatWindow(QMainWindow):
         self._message_filter_mode = "all"
         self._last_render_messages = []
         self._hidden_messages: set = set()
+        self._active_worker: Optional[FunctionWorker] = None
         self.setWindowTitle(f"Chat over DNSTT - {self.session.display_name}")
         self.resize(1150, 760)
         self.setAcceptDrops(True)
@@ -652,10 +659,14 @@ class ChatWindow(QMainWindow):
         self._transport_busy = True
         self._active_transport_kind = kind
         worker = FunctionWorker(fn)
+        self._active_worker = worker
 
         def _finished(result, error) -> None:
+            self._active_worker = None
             self._transport_busy = False
             self._active_transport_kind = ""
+            if self._is_shutting_down:
+                return
             callback(result, error)
             self._pump_transport_queue()
 
@@ -1233,11 +1244,19 @@ class ChatWindow(QMainWindow):
             dns_ips=self.config["dns_ips"],
             proxy_ports=self.config["proxy_ports"],
         )
-        self._enqueue_transport_task(
-            "slipstream_start",
-            lambda: self.slipstream_manager.start(lambda text: self.system_signal.emit(text)),
-            lambda _result, error: self._on_slipstream_started(error),
+        worker = FunctionWorker(
+            lambda: self.slipstream_manager.start(lambda text: self.system_signal.emit(text))
         )
+        self._slip_worker = worker
+
+        def _on_done(_result, error):
+            self._slip_worker = None
+            if self._is_shutting_down:
+                return
+            self._on_slipstream_started(error)
+
+        worker.signals.finished.connect(_on_done)
+        QThreadPool.globalInstance().start(worker)
 
     def _on_slipstream_started(self, error) -> None:
         if error:
@@ -1253,7 +1272,11 @@ class ChatWindow(QMainWindow):
             self.poll_timer.stop()
         if hasattr(self, "online_timer") and self.online_timer:
             self.online_timer.stop()
-        self.thread_pool.waitForDone(3000)
+        if self._active_worker:
+            self._active_worker.cancel()
+        if getattr(self, "_slip_worker", None):
+            self._slip_worker.cancel()
+        self.thread_pool.waitForDone(5000)
         if self.slipstream_manager:
             self.slipstream_manager.stop()
 
