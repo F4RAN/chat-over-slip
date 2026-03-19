@@ -78,7 +78,10 @@ def _setup_crash_logging() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
         f = open(CRASH_LOG_PATH, "a", encoding="utf-8")
-        f.write(f"\n--- {datetime.now().isoformat()} --- App start ---\n")
+        f.write(
+            f"\n--- {datetime.now().isoformat()} --- App start ---\n"
+            "Note: Segfaults during send often occur in subprocess.run (worker thread).\n"
+        )
         f.flush()
         faulthandler.enable(file=f, all_threads=True)
         _orig_excepthook = sys.excepthook
@@ -384,7 +387,9 @@ class ChatWindow(QMainWindow):
         self.config = config
         self.on_close_callback = on_close_callback
         self.startup_lines = startup_lines or []
-        self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(1)
+        self.thread_pool.setExpiryTimeout(-1)
         self.transport = ChatTransport(
             mode=config["mode"],
             host=config.get("host", ""),
@@ -397,12 +402,15 @@ class ChatWindow(QMainWindow):
         )
         self.session = ChatSessionModel(display_name=config.get("name") or config["user"])
         self.slipstream_manager: Optional[SlipstreamManager] = None
+        self._transport_busy = False
+        self._active_transport_kind = ""
+        self._transport_queue: List[Tuple[str, Callable, Callable]] = []
         self.read_busy = False
         self.retry_busy = False
-        self._send_busy = False
         self._rendering = False
         self.online_busy = False
         self._online_refresh_started = False
+        self._slipstream_ready = config["mode"] != "dns"
         self.server_online_users: List[str] = []
         self.emoji_picker: Optional[EmojiPickerDialog] = None
         self._last_incoming_sound_at = 0.0
@@ -428,9 +436,10 @@ class ChatWindow(QMainWindow):
         self.poll_timer.start(int(STATUS_POLL_INTERVAL * 1000))
         self.online_timer = QTimer(self)
         self.online_timer.timeout.connect(self._refresh_online_users)
-        self._poll()
         if config["mode"] == "dns":
             self._start_slipstream_clients()
+        else:
+            self._poll()
 
     def _play_outgoing_sound(self) -> None:
         if self._is_shutting_down:
@@ -616,6 +625,42 @@ class ChatWindow(QMainWindow):
         refresh_action = QAction("Refresh Now", self)
         refresh_action.triggered.connect(self._poll)
         menu.addAction(refresh_action)
+
+    def _has_transport_task(self, kind: str) -> bool:
+        return self._active_transport_kind == kind or any(task_kind == kind for task_kind, _fn, _callback in self._transport_queue)
+
+    def _enqueue_transport_task(
+        self,
+        kind: str,
+        fn: Callable,
+        callback: Callable[[object, object], None],
+        *,
+        dedupe: bool = False,
+    ) -> bool:
+        if self._is_shutting_down:
+            return False
+        if dedupe and self._has_transport_task(kind):
+            return False
+        self._transport_queue.append((kind, fn, callback))
+        self._pump_transport_queue()
+        return True
+
+    def _pump_transport_queue(self) -> None:
+        if self._is_shutting_down or self._transport_busy or not self._transport_queue:
+            return
+        kind, fn, callback = self._transport_queue.pop(0)
+        self._transport_busy = True
+        self._active_transport_kind = kind
+        worker = FunctionWorker(fn)
+
+        def _finished(result, error) -> None:
+            self._transport_busy = False
+            self._active_transport_kind = ""
+            callback(result, error)
+            self._pump_transport_queue()
+
+        worker.signals.finished.connect(_finished)
+        self.thread_pool.start(worker)
 
     def _render_status(self, statuses: Dict[str, str], last_error: str) -> None:
         values = list(statuses.values())
@@ -837,16 +882,15 @@ class ChatWindow(QMainWindow):
         )
 
     def _poll(self) -> None:
-        if self.read_busy or self._send_busy or self._is_shutting_down:
+        if self._is_shutting_down or not self._slipstream_ready or self.read_busy:
             return
         self.read_busy = True
 
         def _read_cycle():
             return self.transport.read_messages(200)
 
-        worker = FunctionWorker(_read_cycle)
-        worker.signals.finished.connect(self._on_poll_finished)
-        self.thread_pool.start(worker)
+        if not self._enqueue_transport_task("poll", _read_cycle, self._on_poll_finished, dedupe=True):
+            self.read_busy = False
 
     def _on_poll_finished(self, result, error) -> None:
         self.read_busy = False
@@ -884,9 +928,8 @@ class ChatWindow(QMainWindow):
             self.transport.touch_presence(self.session.display_name)
             return self.transport.fetch_online_users(ONLINE_PRESENCE_WINDOW_SECONDS)
 
-        worker = FunctionWorker(_online_cycle)
-        worker.signals.finished.connect(self._on_online_users_finished)
-        self.thread_pool.start(worker)
+        if not self._enqueue_transport_task("online_refresh", _online_cycle, self._on_online_users_finished, dedupe=True):
+            self.online_busy = False
 
     def _on_online_users_finished(self, result, error) -> None:
         self.online_busy = False
@@ -896,16 +939,22 @@ class ChatWindow(QMainWindow):
         self._render_online_users()
 
     def _retry_pending_once(self) -> None:
-        if self.retry_busy or not self.session.pending_messages:
+        if self._is_shutting_down or self.retry_busy or not self.session.pending_messages:
             return
         self.retry_busy = True
         user, text = self.session.pending_messages[0]
-        worker = FunctionWorker(lambda: self.transport.send_message(user, text))
-        worker.signals.finished.connect(lambda result, error: self._on_retry_finished(user, text, result, error))
-        self.thread_pool.start(worker)
+        if not self._enqueue_transport_task(
+            "retry_send",
+            lambda: self.transport.send_message(user, text),
+            lambda result, error: self._on_retry_finished(user, text, result, error),
+            dedupe=True,
+        ):
+            self.retry_busy = False
 
     def _on_retry_finished(self, user: str, text: str, result, error) -> None:
         self.retry_busy = False
+        if self._is_shutting_down:
+            return
         if error:
             self.transport.last_error = str(error)
             self._render_status(self.transport.status, self.transport.last_error)
@@ -977,15 +1026,17 @@ class ChatWindow(QMainWindow):
         self._send_text(text)
 
     def _send_text(self, text: str) -> None:
-        self._send_busy = True
+        if self._is_shutting_down:
+            return
         messages = self.session.append_pending_message(text)
         self._render_messages(messages)
-        worker = FunctionWorker(lambda: self.transport.send_message(self.session.display_name, text))
-        worker.signals.finished.connect(lambda result, error: self._on_send_finished(text, result, error))
-        self.thread_pool.start(worker)
+        self._enqueue_transport_task(
+            "send_message",
+            lambda: self.transport.send_message(self.session.display_name, text),
+            lambda result, error: self._on_send_finished(text, result, error),
+        )
 
     def _on_send_finished(self, text: str, result, error) -> None:
-        self._send_busy = False
         if self._is_shutting_down:
             return
         if error:
@@ -1001,11 +1052,11 @@ class ChatWindow(QMainWindow):
         self._poll()
 
     def _clear_chat(self) -> None:
-        worker = FunctionWorker(self.transport.clear_messages)
-        worker.signals.finished.connect(self._on_clear_finished)
-        self.thread_pool.start(worker)
+        self._enqueue_transport_task("clear_chat", self.transport.clear_messages, self._on_clear_finished)
 
     def _on_clear_finished(self, result, error) -> None:
+        if self._is_shutting_down:
+            return
         if error:
             self._append_system_message(f"Clear failed: {error}")
             return
@@ -1019,11 +1070,15 @@ class ChatWindow(QMainWindow):
 
     def _fetch_news(self, channel: str, range_spec: str) -> None:
         self._append_system_message(f"Fetching news: {channel} {range_spec}")
-        worker = FunctionWorker(lambda: self.transport.fetch_news(channel, range_spec))
-        worker.signals.finished.connect(lambda result, error: self._on_news_finished(channel, range_spec, result, error))
-        self.thread_pool.start(worker)
+        self._enqueue_transport_task(
+            "fetch_news",
+            lambda: self.transport.fetch_news(channel, range_spec),
+            lambda result, error: self._on_news_finished(channel, range_spec, result, error),
+        )
 
     def _on_news_finished(self, channel: str, range_spec: str, result, error) -> None:
+        if self._is_shutting_down:
+            return
         if error:
             self._append_system_message(f"News failed: {error}")
             return
@@ -1069,9 +1124,7 @@ class ChatWindow(QMainWindow):
         def _run():
             return self.transport.upload_file(path, progress_cb)
 
-        worker = FunctionWorker(_run)
-        worker.signals.finished.connect(self._on_upload_finished)
-        self.thread_pool.start(worker)
+        self._enqueue_transport_task("upload_file", _run, self._on_upload_finished)
 
     def _on_upload_finished(self, result, error) -> None:
         if self._is_shutting_down:
@@ -1106,9 +1159,11 @@ class ChatWindow(QMainWindow):
                 progress_cb,
             )
 
-        worker = FunctionWorker(_run)
-        worker.signals.finished.connect(lambda result, error: self._on_download_finished(name, result, error))
-        self.thread_pool.start(worker)
+        self._enqueue_transport_task(
+            "download_file",
+            _run,
+            lambda result, error: self._on_download_finished(name, result, error),
+        )
 
     def _on_download_finished(self, name: str, result, error) -> None:
         if self._is_shutting_down:
@@ -1178,22 +1233,27 @@ class ChatWindow(QMainWindow):
             dns_ips=self.config["dns_ips"],
             proxy_ports=self.config["proxy_ports"],
         )
-        worker = FunctionWorker(lambda: self.slipstream_manager.start(lambda text: self.system_signal.emit(text)))
-        worker.signals.finished.connect(lambda _result, error: self._on_slipstream_started(error))
-        self.thread_pool.start(worker)
+        self._enqueue_transport_task(
+            "slipstream_start",
+            lambda: self.slipstream_manager.start(lambda text: self.system_signal.emit(text)),
+            lambda _result, error: self._on_slipstream_started(error),
+        )
 
     def _on_slipstream_started(self, error) -> None:
         if error:
             self._append_system_message(f"Slipstream startup error: {error}")
             return
+        self._slipstream_ready = True
         self._poll()
 
     def _shutdown(self) -> None:
         self._is_shutting_down = True
+        self._transport_queue.clear()
         if hasattr(self, "poll_timer") and self.poll_timer:
             self.poll_timer.stop()
         if hasattr(self, "online_timer") and self.online_timer:
             self.online_timer.stop()
+        self.thread_pool.waitForDone(3000)
         if self.slipstream_manager:
             self.slipstream_manager.stop()
 
