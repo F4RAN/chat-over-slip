@@ -72,7 +72,31 @@ from chat_common.session import (
 )
 from chat_common.transport import ChatTransport, STATUS_POLL_INTERVAL
 
-CRASH_LOG_PATH = Path.home() / ".chat-over-dnstt" / "crash.log"
+def _resolve_log_dir() -> Path:
+    """Resolve the log directory, preferring ~/.chat-over-dnstt but falling back
+    next to the executable for frozen builds where Path.home() may be unreliable."""
+    home_dir = Path.home() / ".chat-over-dnstt"
+    try:
+        home_dir.mkdir(parents=True, exist_ok=True)
+        # Verify we can actually write there
+        _probe = home_dir / ".write_test"
+        _probe.write_text("ok", encoding="utf-8")
+        _probe.unlink()
+        return home_dir
+    except OSError:
+        pass
+    if getattr(sys, "frozen", False):
+        fallback = Path(sys.executable).resolve().parent / ".chat-over-dnstt"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        except OSError:
+            pass
+    return home_dir  # last resort, mkdir will be attempted again later
+
+
+_LOG_DIR = _resolve_log_dir()
+CRASH_LOG_PATH = _LOG_DIR / "crash.log"
 
 
 log = logging.getLogger("chat_gui")
@@ -94,7 +118,8 @@ def _setup_crash_logging() -> None:
     ))
     log.addHandler(file_handler)
     log.setLevel(logging.DEBUG)
-    log.info("=== App start (PID %d) ===", os.getpid())
+    log.info("=== App start (PID %d) === log_dir=%s", os.getpid(), log_dir)
+    print(f"[chat-over-dnstt] Logs: {log_dir}", file=sys.stderr, flush=True)
 
     try:
         f = open(CRASH_LOG_PATH, "a", encoding="utf-8")
