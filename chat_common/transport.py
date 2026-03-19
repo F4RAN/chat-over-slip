@@ -332,6 +332,7 @@ class ChatTransport:
             self.proxy_ports.pop(idx)
         self.status.pop(label, None)
         self.fail_counts.pop(label, None)
+        self.retry_counts.pop(label, None)
         self.last_online_at.pop(label, None)
         return True
 
@@ -366,10 +367,12 @@ class ChatTransport:
 
         first_output = None
         remote_command = f"bash {self.remote_script} -r {limit}"
-        with ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports))) as executor:
+        # Snapshot current links to avoid races with remove_dns_link.
+        current_links = list(zip(self.dns_ips, self.proxy_ports))
+        with ThreadPoolExecutor(max_workers=max(1, len(current_links))) as executor:
             futures = [
                 executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-                for ip, port in zip(self.dns_ips, self.proxy_ports)
+                for ip, port in current_links
             ]
             for future in as_completed(futures):
                 ip, state, output, error = future.result()
@@ -381,7 +384,9 @@ class ChatTransport:
                     self.last_error = f"{ip}: {error}"
                 elif state == "ok" and first_output is None:
                     first_output = output
-        return first_output, dict(self.status)
+        # Only return status for links that still exist.
+        live = set(self.dns_ips)
+        return first_output, {k: v for k, v in self.status.items() if k in live}
 
     def send_message(self, name: str, text: str) -> Tuple[bool, str, Dict[str, str]]:
         msg_id = uuid.uuid4().hex
@@ -416,10 +421,11 @@ class ChatTransport:
 
         successes = 0
         errors = []
-        executor = ThreadPoolExecutor(max_workers=max(1, len(self.proxy_ports)))
+        current_links = list(zip(self.dns_ips, self.proxy_ports))
+        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
         futures = [
             executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-            for ip, port in zip(self.dns_ips, self.proxy_ports)
+            for ip, port in current_links
         ]
         try:
             for future in as_completed(futures):
@@ -428,7 +434,8 @@ class ChatTransport:
                     self._mark_success(ip)
                     successes += 1
                     executor.shutdown(wait=False, cancel_futures=True)
-                    return True, "", dict(self.status)
+                    live = set(self.dns_ips)
+                    return True, "", {k: v for k, v in self.status.items() if k in live}
                 self._mark_failure(ip, error)
                 if state == "fail":
                     errors.append(f"{ip}: {error or 'send failed'}")
@@ -436,7 +443,8 @@ class ChatTransport:
             executor.shutdown(wait=False, cancel_futures=True)
         if errors:
             self.last_error = "; ".join(errors)
-        return successes > 0, "; ".join(errors), dict(self.status)
+        live = set(self.dns_ips)
+        return successes > 0, "; ".join(errors), {k: v for k, v in self.status.items() if k in live}
 
     def clear_messages(self) -> Tuple[bool, str]:
         remote_command = f"bash {self.remote_script} -c"
