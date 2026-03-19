@@ -22,10 +22,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from rich import box
-from rich.align import Align
 from rich.console import Group
 from rich.markup import escape
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -718,40 +718,53 @@ class ChatView(Static):
                 return True
         return False
 
-    def _rtl_wrap(self, text: str) -> Text:
-        """Return right-justified Text with LRM anchors to stay inside the panel.
+    def _write_message(self, header_markup: str, body_text: str, pending: bool = False) -> None:
+        """Write a chat message to the chat area.
 
-        Prepend U+200E LEFT-TO-RIGHT MARK at the start of every wrapped line.
-        The terminal sees LRM as the first strong character → LTR paragraph
-        direction → content stays inside the panel instead of overflowing
-        to the right edge of the terminal.
+        For RTL text, renders WITHOUT Panel borders to avoid terminal bidi
+        reordering the box-drawing characters and pushing content outside
+        the visible area.  Uses a dim rule + header + plain text instead.
+
+        For LTR text, uses the original Panel-based rendering.
         """
-        if not text:
-            return Text.from_markup("")
-        if not self._has_rtl(text):
-            return Text.from_markup(text)
-        import textwrap
-        LRM = "\u200E"
-        # Compute available width from terminal width minus all overhead.
-        # Be conservative to prevent any overflow into the status panel.
-        # status panel ~32 + chat border 2 + chat padding 4 +
-        # panel border 2 + panel padding 2 + scrollbar 2 + safety 6 = 50
-        try:
-            max_w = max(20, self.app.size.width - 50)
-        except Exception:
-            max_w = 60
-        plain = Text.from_markup(text).plain
-        result_lines: list[str] = []
-        for para in plain.split("\n"):
-            if para.strip():
-                filled = textwrap.fill(para, width=max_w)
-                for line in filled.split("\n"):
-                    result_lines.append(LRM + line)
-            else:
-                result_lines.append("")
-        t = Text("\n".join(result_lines))
-        t.justify = "right"
-        return t
+        if self._has_rtl(body_text):
+            self._write_rtl_message(header_markup, body_text, pending)
+        else:
+            body = Text.from_markup(body_text)
+            if pending:
+                body.append(" (pending)", style="yellow")
+            self.chat_area.write(
+                Panel(
+                    Group(Text.from_markup(header_markup), body),
+                    padding=(0, 1),
+                    border_style="dim",
+                    box=box.ROUNDED,
+                )
+            )
+
+    def _write_rtl_message(self, header_markup: str, body_text: str, pending: bool = False) -> None:
+        """Render an RTL message without Panel borders.
+
+        Terminal bidi algorithms reorder box-drawing chars (│) alongside
+        RTL text, breaking Panel layouts.  Instead we write:
+          ── dim rule ──
+          header (timestamp + user)
+          body text (plain, no borders)
+        The terminal handles RTL naturally when there are no LTR border
+        characters on the same line to confuse the bidi algorithm.
+        """
+        # Thin separator
+        self.chat_area.write(Rule(style="dim"))
+        # Header line
+        self.chat_area.write(Text.from_markup(header_markup))
+        # Body
+        plain = Text.from_markup(body_text).plain
+        body = Text(plain)
+        if pending:
+            body.append(" (pending)", style="yellow")
+        self.chat_area.write(body)
+        # Blank line after message
+        self.chat_area.write(Text(""))
 
     def _play_notification_sound(self) -> None:
         def _run() -> None:
@@ -773,11 +786,8 @@ class ChatView(Static):
     def _append_local_line(self, user: str, text: str, pending: bool = False) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         display_text, _ = self._parse_file_message(text)
-        body = self._rtl_wrap(display_text)
-        if pending:
-            body.append(" (pending)", style="yellow")
         header = f"[dim]{now}[/] [bold]{user}[/]"
-        self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
+        self._write_message(header, display_text, pending=pending)
 
     def write_system(self, text: str, style: str = "dim") -> None:
         self.chat_area.write(f"[{style}]{text}[/{style}]")
@@ -865,9 +875,8 @@ class ChatView(Static):
                         should_play = True
                     self.seen_msg_ids.add(msg_id)
                     display_text, file_entry = self._parse_file_message(text)
-                    body = self._rtl_wrap(display_text)
                     header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
+                    self._write_message(header, display_text)
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
