@@ -25,9 +25,7 @@ from rich import box
 from rich.align import Align
 from rich.console import Group
 from rich.markup import escape
-from rich.measure import Measurement
 from rich.panel import Panel
-from rich.segment import Segment
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -665,33 +663,6 @@ class UploadInput(Input):
         super()._on_paste(event)
 
 
-class BidiSafe:
-    """Wraps a Rich renderable and adds LTR Isolate markers to each rendered line.
-
-    Terminal bidi algorithms operate per-line. When RTL characters appear on the
-    same line as Panel border chars (│, ╭, ╰, …), the terminal may reorder the
-    entire line, breaking the TUI layout.  This wrapper renders the inner object
-    first, then prepends U+2066 (LRI) and appends U+2069 (PDI) to every output
-    line, forcing the terminal to treat each line as LTR-isolated.
-    """
-
-    def __init__(self, inner):
-        self.inner = inner
-
-    def __rich_console__(self, console, options):
-        lri = Segment("\u2066")
-        pdi = Segment("\u2069")
-        newline = Segment("\n")
-        for line_segments in console.render_lines(self.inner, options, pad=False):
-            yield lri
-            yield from line_segments
-            yield pdi
-            yield newline
-
-    def __rich_measure__(self, console, options):
-        return Measurement.get(console, options, self.inner)
-
-
 class ChatView(Static):
     DEFAULT_CSS = """
     ChatView {
@@ -748,11 +719,32 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Return a Rich Text for the message body, right-justified for RTL."""
-        t = Text.from_markup(text or "")
-        if text and self._has_rtl(text):
+        """Return a Rich Text, converting RTL text to visual order.
+
+        Terminal bidi algorithms reorder RTL characters across the full
+        terminal line, ignoring Rich Panel boundaries.  We convert to
+        visual display order with python-bidi and wrap with LRO/PDF so
+        the terminal renders characters exactly as placed by Rich,
+        keeping text inside the panel.
+        """
+        if not text:
+            return Text.from_markup("")
+        if not self._has_rtl(text):
+            return Text.from_markup(text)
+        try:
+            from bidi.algorithm import get_display
+            plain = Text.from_markup(text)
+            # Convert each line to visual order independently.
+            lines = plain.plain.split("\n")
+            visual_lines = [get_display(line) for line in lines]
+            visual = "\n".join(visual_lines)
+            # Wrap with LRO/PDF to prevent bidi-aware terminals from
+            # double-reversing the already-visual-order text.
+            t = Text("\u202D" + visual + "\u202C")
             t.justify = "right"
-        return t
+            return t
+        except ImportError:
+            return Text.from_markup(text)
 
     def _play_notification_sound(self) -> None:
         def _run() -> None:
@@ -771,27 +763,6 @@ class ChatView(Static):
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _make_panel(self, header: str, body, rtl: bool = False):
-        """Create a Panel constrained to the chat area width."""
-        panel = Panel(
-            Group(Text.from_markup(header), body),
-            padding=(0, 1),
-            border_style="dim",
-            box=box.ROUNDED,
-        )
-        # Constrain panel width to the chat area content width so it never
-        # bleeds into the status sidebar (especially with RTL text).
-        try:
-            # content_size excludes border/padding of the RichLog widget
-            max_w = self.chat_area.content_size.width
-            if max_w > 0:
-                panel.width = max_w
-        except Exception:
-            pass
-        if rtl:
-            return BidiSafe(panel)
-        return panel
-
     def _append_local_line(self, user: str, text: str, pending: bool = False) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         display_text, _ = self._parse_file_message(text)
@@ -799,7 +770,7 @@ class ChatView(Static):
         if pending:
             body.append(" (pending)", style="yellow")
         header = f"[dim]{now}[/] [bold]{user}[/]"
-        self.chat_area.write(self._make_panel(header, body, self._has_rtl(text)))
+        self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
 
     def write_system(self, text: str, style: str = "dim") -> None:
         self.chat_area.write(f"[{style}]{text}[/{style}]")
@@ -889,7 +860,7 @@ class ChatView(Static):
                     display_text, file_entry = self._parse_file_message(text)
                     body = self._rtl_wrap(display_text)
                     header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    self.chat_area.write(self._make_panel(header, body, self._has_rtl(text)))
+                    self.chat_area.write(Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED))
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
