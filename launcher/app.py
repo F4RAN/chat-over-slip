@@ -308,6 +308,39 @@ class ChatSessionScreen(Screen):
         self.slip_procs = []
         self.chat_view: Optional[ChatView] = None
 
+    def _on_restart_link(self, ip: str, port: int) -> None:
+        """Restart slipstream process for a DNS link that got 'unknown port 65535'."""
+        if self.config["mode"] != "dns":
+            return
+        slip_path = Path(self.config.get("slip_path", ""))
+        domain = self.config.get("domain", "")
+        if not slip_path.exists():
+            return
+        # Find and kill the old process for this port
+        idx = None
+        if self.chat_view and ip in self.chat_view.transport.dns_ips:
+            idx = self.chat_view.transport.dns_ips.index(ip)
+        if idx is not None and idx < len(self.slip_procs):
+            old_proc = self.slip_procs[idx]
+            old_proc.terminate()
+            try:
+                old_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                old_proc.kill()
+            proc = subprocess.Popen(
+                [
+                    "/usr/local/bin/slipstream-client",
+                    "--tcp-listen-port", str(port),
+                    "--resolver", f"{ip}:53",
+                    "--domain", domain,
+                ],
+                cwd=str(slip_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.slip_procs[idx] = proc
+
     def _on_new_dns_ip(self, ip: str, port: int) -> None:
         if self.config["mode"] != "dns":
             return
@@ -349,6 +382,7 @@ class ChatSessionScreen(Screen):
             self.startup_lines,
             scanner_input_file=self.config.get("scanner_input_file", ""),
             on_new_dns_ip=self._on_new_dns_ip,
+            on_restart_link=self._on_restart_link,
         )
         yield self.chat_view
         yield Footer()
