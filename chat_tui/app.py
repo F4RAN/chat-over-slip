@@ -732,11 +732,12 @@ class ChatView(Static):
             return Text.from_markup(text)
         import textwrap
         LRM = "\u200E"
-        # Compute available width from terminal width minus all overhead:
-        # status panel (28) + chat border (2) + chat padding (4) +
-        # panel border (2) + panel padding (2) + scrollbar (2) = 40
+        # Compute available width from terminal width minus all overhead.
+        # Be conservative to prevent any overflow into the status panel.
+        # status panel ~32 + chat border 2 + chat padding 4 +
+        # panel border 2 + panel padding 2 + scrollbar 2 + safety 6 = 50
         try:
-            max_w = max(20, self.app.size.width - 40)
+            max_w = max(20, self.app.size.width - 50)
         except Exception:
             max_w = 60
         plain = Text.from_markup(text).plain
