@@ -46,6 +46,7 @@ SOFT_ERROR_OK_GRACE_FAILURES = 3
 SOFT_ERROR_UNKNOWN_GRACE_FAILURES = 2
 SSH_SEND_RETRIES = 3
 SSH_SEND_RETRY_DELAY = 2
+DNS_LINK_MAX_RETRIES = 2
 APP_RUNTIME_ROOT = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -86,6 +87,8 @@ class ChatTransport:
             self.status = {"ssh": "unknown"}
             self.fail_counts = {"ssh": 0}
             self.last_online_at = {"ssh": None}
+        self.retry_counts: Dict[str, int] = {}
+        self._pending_restarts: List[str] = []
         self.last_error = ""
 
     def _normalize_remote_script(self, path: str) -> str:
@@ -290,14 +293,27 @@ class ChatTransport:
                 except OSError:
                     pass
 
+    def _needs_restart(self, error: str) -> bool:
+        return "unknown port 65535" in (error or "").lower()
+
     def _mark_success(self, label: str) -> None:
         self.status[label] = "ok"
         self.fail_counts[label] = 0
+        self.retry_counts[label] = 0
         self.last_online_at[label] = datetime.now(timezone.utc)
 
     def _mark_failure(self, label: str, error: str) -> None:
+        if self.retry_counts.get(label, 0) >= DNS_LINK_MAX_RETRIES and self._needs_restart(error):
+            self.status[label] = "fail"
+            return
         self.fail_counts[label] = self.fail_counts.get(label, 0) + 1
-        if self._soft_error(error):
+        if self._needs_restart(error):
+            self.retry_counts[label] = self.retry_counts.get(label, 0) + 1
+            self.status[label] = "unknown"
+            self.fail_counts[label] = 0
+            if label not in self._pending_restarts:
+                self._pending_restarts.append(label)
+        elif self._soft_error(error):
             if self.status.get(label) == "ok" and self.fail_counts[label] < SOFT_ERROR_OK_GRACE_FAILURES:
                 self.status[label] = "ok"
             elif self.fail_counts[label] < SOFT_ERROR_UNKNOWN_GRACE_FAILURES:
@@ -306,6 +322,11 @@ class ChatTransport:
                 self.status[label] = "fail"
         else:
             self.status[label] = "fail"
+
+    def pop_pending_restarts(self) -> List[str]:
+        restarts = self._pending_restarts[:]
+        self._pending_restarts.clear()
+        return restarts
 
     def last_online_age_seconds(self, label: str, now: Optional[datetime] = None) -> Optional[int]:
         when = self.last_online_at.get(label)
