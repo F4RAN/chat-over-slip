@@ -771,6 +771,27 @@ class ChatView(Static):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _make_panel(self, header: str, body, rtl: bool = False):
+        """Create a Panel constrained to the chat area width."""
+        panel = Panel(
+            Group(Text.from_markup(header), body),
+            padding=(0, 1),
+            border_style="dim",
+            box=box.ROUNDED,
+        )
+        # Constrain panel width to the chat area content width so it never
+        # bleeds into the status sidebar (especially with RTL text).
+        try:
+            # content_size excludes border/padding of the RichLog widget
+            max_w = self.chat_area.content_size.width
+            if max_w > 0:
+                panel.width = max_w
+        except Exception:
+            pass
+        if rtl:
+            return BidiSafe(panel)
+        return panel
+
     def _append_local_line(self, user: str, text: str, pending: bool = False) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         display_text, _ = self._parse_file_message(text)
@@ -778,8 +799,7 @@ class ChatView(Static):
         if pending:
             body.append(" (pending)", style="yellow")
         header = f"[dim]{now}[/] [bold]{user}[/]"
-        panel = Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED)
-        self.chat_area.write(BidiSafe(panel) if self._has_rtl(text) else panel)
+        self.chat_area.write(self._make_panel(header, body, self._has_rtl(text)))
 
     def write_system(self, text: str, style: str = "dim") -> None:
         self.chat_area.write(f"[{style}]{text}[/{style}]")
@@ -869,8 +889,7 @@ class ChatView(Static):
                     display_text, file_entry = self._parse_file_message(text)
                     body = self._rtl_wrap(display_text)
                     header = f"[dim]{ts}[/] [bold]{user}[/]"
-                    panel = Panel(Group(Text.from_markup(header), body), padding=(0, 1), border_style="dim", box=box.ROUNDED)
-                    self.chat_area.write(BidiSafe(panel) if self._has_rtl(text) else panel)
+                    self.chat_area.write(self._make_panel(header, body, self._has_rtl(text)))
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
