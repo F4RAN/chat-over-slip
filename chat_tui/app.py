@@ -647,7 +647,8 @@ class StatusPanel(Static):
             return f"{age_seconds // 3600}h ago"
         return f"{age_seconds // 86400}d ago"
 
-    def _overall_state(self, statuses: Dict[str, str]) -> Tuple[str, str]:
+    @staticmethod
+    def _overall_state(statuses: Dict[str, str]) -> Tuple[str, str]:
         values = list(statuses.values())
         if any(state == "ok" for state in values):
             return "online", "green"
@@ -660,8 +661,6 @@ class StatusPanel(Static):
         mode: str,
         statuses: Dict[str, str],
         last_error: str = "",
-        ages: Optional[Dict[str, Optional[int]]] = None,
-        scanner_text: str = "",
     ) -> None:
         lines = [f"[bold]Mode[/]: {mode}"]
         if not statuses:
@@ -669,14 +668,8 @@ class StatusPanel(Static):
         else:
             overall, color = self._overall_state(statuses)
             lines += ["", f"[bold]State[/]: [{color}]{overall}[/{color}]"]
-            lines += ["", "[bold]Links[/]"]
-            for label, state in statuses.items():
-                color = "yellow" if state == "unknown" else ("green" if state == "ok" else "red")
-                age = self._format_age((ages or {}).get(label))
-                line = f"[{color}]{label}: {age}[/{color}]"
-                lines.append(line)
         if last_error:
-            lines += ["", "[bold]Last Error[/]", f"[red]{last_error}[/red]"]
+            lines += ["", f"[bold]Error[/]", f"[red]{last_error}[/red]"]
         self.update("\n".join(lines))
 
 
@@ -739,33 +732,53 @@ class ChatView(Static):
         border: solid $primary;
     }
     #sidebar {
-        width: 28;
+        width: 30;
         height: 1fr;
-        padding: 1;
+        padding: 0;
         border: solid $primary;
         background: $surface-darken-1;
     }
     #status {
         height: auto;
+        padding: 1;
+    }
+    #links-header {
+        height: auto;
+        padding: 0 1;
     }
     #dns-btns {
         height: auto;
         layout: vertical;
         padding: 0;
     }
-    .dns-x-btn {
+    .dns-link-btn {
         height: 1;
-        min-width: 6;
-        width: auto;
+        width: 1fr;
         margin: 0;
         padding: 0;
+        border: none;
+        text-style: none;
+        content-align: left middle;
+    }
+    .dns-link-fail {
+        background: $surface-darken-1;
+        color: red;
+    }
+    .dns-link-fail:hover {
         background: darkred;
         color: white;
-        border: none;
-        text-style: bold;
     }
-    .dns-x-btn:hover {
-        background: red;
+    .dns-link-ok {
+        background: $surface-darken-1;
+        color: green;
+    }
+    .dns-link-unknown {
+        background: $surface-darken-1;
+        color: yellow;
+    }
+    #error-text {
+        height: auto;
+        padding: 0 1;
     }
     #scan-btn {
         height: 3;
@@ -780,7 +793,7 @@ class ChatView(Static):
     }
     #scan-status {
         height: auto;
-        padding: 0;
+        padding: 0 1;
     }
     #input-area {
         height: auto;
@@ -1025,7 +1038,9 @@ class ChatView(Static):
         with Container(id="main"):
             with VerticalScroll(id="sidebar"):
                 yield StatusPanel(id="status")
+                yield Static("[bold]Links[/]", id="links-header")
                 yield Vertical(id="dns-btns")
+                yield Static("", id="error-text")
                 yield Button("Scan", id="scan-btn")
                 yield Static("", id="scan-status")
             yield RichLog(id="chat-area", wrap=True, markup=True)
@@ -1041,11 +1056,15 @@ class ChatView(Static):
         self.dns_btns_container = self.query_one("#dns-btns", Vertical)
         self.scan_btn = self.query_one("#scan-btn", Button)
         self.scan_status_w = self.query_one("#scan-status", Static)
-        self._last_failed_ips: set = set()
+        self.error_text_w = self.query_one("#error-text", Static)
+        self.links_header_w = self.query_one("#links-header", Static)
+        self._last_link_snapshot: str = ""
         if self.transport.mode != "dns":
             self.scan_btn.display = False
             self.dns_btns_container.display = False
             self.scan_status_w.display = False
+            self.links_header_w.display = False
+            self.error_text_w.display = False
         for line in self.startup_lines:
             self.write_system(line)
         self._render_status_panel(self.transport.status)
@@ -1054,30 +1073,40 @@ class ChatView(Static):
         self._scan_timer = self.set_interval(2, self._poll_scanner, pause=True)
 
     def _render_status_panel(self, statuses: Dict[str, str]) -> None:
-        ages = {label: self.transport.last_online_age_seconds(label) for label in statuses}
+        is_dns = self.transport.mode == "dns"
         self.status_panel.render_status(
             self.transport.mode.upper(),
             statuses,
-            self.transport.last_error,
-            ages,
+            "" if is_dns else self.transport.last_error,
         )
-        if self.transport.mode == "dns":
-            self._update_dns_buttons(statuses)
+        if is_dns:
+            ages = {label: self.transport.last_online_age_seconds(label) for label in statuses}
+            self._update_link_buttons(statuses, ages)
+            err = self.transport.last_error
+            self.error_text_w.update(f"[red]{err}[/red]" if err else "")
             scanner_text = self._scanner_status_text()
             self.scan_status_w.update(f"[dim]{scanner_text}[/dim]" if scanner_text else "")
 
-    def _update_dns_buttons(self, statuses: Dict[str, str]) -> None:
-        failed = {ip for ip, state in statuses.items() if state == "fail"}
-        if failed == self._last_failed_ips:
+    def _update_link_buttons(self, statuses: Dict[str, str], ages: Dict[str, Optional[int]]) -> None:
+        # Build a snapshot string to detect changes
+        snapshot = "|".join(f"{ip}:{st}:{ages.get(ip)}" for ip, st in statuses.items())
+        if snapshot == self._last_link_snapshot:
             return
-        self._last_failed_ips = set(failed)
-        # Remove existing x buttons
+        self._last_link_snapshot = snapshot
+        # Remove old buttons
         for child in list(self.dns_btns_container.children):
             child.remove()
-        # Add new x buttons (no id= to avoid duplicates)
-        for ip in sorted(failed):
-            btn = Button(f"[x] {ip}", classes="dns-x-btn")
-            btn.dns_ip = ip
+        # Create a button for each link
+        for ip, state in statuses.items():
+            age_text = StatusPanel._format_age(ages.get(ip))
+            label = f"{ip}: {age_text}"
+            if state == "fail":
+                btn = Button(f"[x] {label}", classes="dns-link-btn dns-link-fail")
+                btn.dns_ip = ip
+            elif state == "ok":
+                btn = Button(label, classes="dns-link-btn dns-link-ok", disabled=True)
+            else:
+                btn = Button(label, classes="dns-link-btn dns-link-unknown", disabled=True)
             self.dns_btns_container.mount(btn)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
