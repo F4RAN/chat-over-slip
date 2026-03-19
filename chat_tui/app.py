@@ -742,29 +742,48 @@ class ChatView(Static):
                 )
             )
 
+    def _rtl_content_width(self) -> int:
+        """Max chars per line for RTL text inside the chat area (no Panel)."""
+        # Overhead: status panel (28) + chat border (2) + chat padding (4)
+        #         + scrollbar (2) + safety (4) = 40
+        try:
+            return max(20, self.app.size.width - 40)
+        except Exception:
+            return 60
+
     def _write_rtl_message(self, header_markup: str, body_text: str, pending: bool = False) -> None:
         """Render an RTL message without Panel borders.
 
-        Terminal bidi algorithms reorder box-drawing chars (│) alongside
-        RTL text, breaking Panel layouts.  Instead we write:
-          ── dim rule ──
-          header (timestamp + user)
-          body text (plain, no borders)
-        The terminal handles RTL naturally when there are no LTR border
-        characters on the same line to confuse the bidi algorithm.
+        Three-part fix for terminal bidi overflow:
+        1. NO Panel borders  – removes box-drawing chars that bidi reorders
+        2. LRM per line       – forces LTR paragraph direction so terminal
+                                does not right-align to terminal edge
+        3. Pre-wrap to width  – ensures each line fits the chat area; Rich
+                                won't re-wrap and lose the LRM anchors
         """
-        # Thin separator
+        import textwrap
+        LRM = "\u200E"
+        max_w = self._rtl_content_width()
+
+        # Separator
         self.chat_area.write(Rule(style="dim"))
-        # Header line
-        self.chat_area.write(Text.from_markup(header_markup))
-        # Body
+        # Header (LRM-anchored so it also stays in place)
+        self.chat_area.write(Text.from_markup(LRM + header_markup))
+
+        # Body – pre-wrap each paragraph, anchor every line with LRM
         plain = Text.from_markup(body_text).plain
-        body = Text(plain)
+        lines: list[str] = []
+        for para in plain.split("\n"):
+            if para.strip():
+                for line in textwrap.fill(para, width=max_w).split("\n"):
+                    lines.append(LRM + line)
+            else:
+                lines.append("")
+
+        body = Text("\n".join(lines))
         if pending:
             body.append(" (pending)", style="yellow")
         self.chat_area.write(body)
-        # Blank line after message
-        self.chat_area.write(Text(""))
 
     def _play_notification_sound(self) -> None:
         def _run() -> None:
