@@ -739,13 +739,13 @@ class ChatView(Static):
             return Text.from_markup(text)
         import textwrap
         LRM = "\u200E"
-        # chat_area.size.width = widget allocated width (includes padding+border).
-        # Subtract: chat padding (2+2=4) + chat border (1+1=2) +
-        #           panel border (1+1=2) + panel padding (0+1+0+1=2) = 10
+        # Compute available width from terminal width minus all overhead:
+        # status panel (28) + chat border (2) + chat padding (4) +
+        # panel border (2) + panel padding (2) + scrollbar (2) = 40
         try:
-            max_w = max(20, self.chat_area.size.width - 10)
+            max_w = max(20, self.app.size.width - 40)
         except Exception:
-            max_w = 70
+            max_w = 60
         plain = Text.from_markup(text).plain
         result_lines: list[str] = []
         for para in plain.split("\n"):
