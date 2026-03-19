@@ -380,21 +380,24 @@ class ChatTransport:
         ]
         if not active:
             return None, dict(self.status)
-        with ThreadPoolExecutor(max_workers=max(1, len(active))) as executor:
-            futures = [
-                executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-                for ip, port in active
-            ]
-            for future in as_completed(futures):
-                ip, state, output, error = future.result()
-                if state == "ok":
-                    self._mark_success(ip)
-                else:
-                    self._mark_failure(ip, error)
-                if error and state == "fail":
-                    self.last_error = f"{ip}: {error}"
-                elif state == "ok" and first_output is None:
+        executor = ThreadPoolExecutor(max_workers=max(1, len(active)))
+        futures = [
+            executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
+            for ip, port in active
+        ]
+        for future in as_completed(futures):
+            ip, state, output, error = future.result()
+            if state == "ok":
+                self._mark_success(ip)
+                if first_output is None:
                     first_output = output
+                # Got a successful read — cancel remaining futures and return early.
+                executor.shutdown(wait=False, cancel_futures=True)
+                return first_output, dict(self.status)
+            else:
+                self._mark_failure(ip, error)
+            if error and state == "fail":
+                self.last_error = f"{ip}: {error}"
         return first_output, dict(self.status)
 
     def send_message(self, name: str, text: str) -> Tuple[bool, str, Dict[str, str]]:
