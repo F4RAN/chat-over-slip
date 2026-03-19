@@ -1295,12 +1295,16 @@ class ChatView(Static):
         if not self.pending_messages or self.transport.mode != "ssh":
             return
         user, text = self.pending_messages[0]
+        preview = text if len(text) <= 30 else text[:27] + "..."
+        self.write_system(f"[yellow]Retrying pending message: {escape(preview)}[/yellow]")
         ok, err, statuses = await asyncio.to_thread(
             self.transport.send_message, user, text
         )
         self._render_status_panel(statuses)
         if not ok:
+            self.write_system(f"[red]Retry failed: {escape(err or 'no working link')}[/red]")
             return
+        self.write_system(f"[green]Retry succeeded[/green]")
         try:
             self.pending_messages.remove((user, text))
         except ValueError:
