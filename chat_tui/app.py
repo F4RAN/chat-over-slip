@@ -1121,6 +1121,9 @@ class ChatView(Static):
 
     def _render_status_panel(self, statuses: Dict[str, str]) -> None:
         is_dns = self.transport.mode == "dns"
+        if is_dns:
+            live = set(self.transport.dns_ips)
+            statuses = {k: v for k, v in statuses.items() if k in live}
         self.status_panel.render_status(
             self.transport.mode.upper(),
             statuses,

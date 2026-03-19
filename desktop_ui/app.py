@@ -770,6 +770,9 @@ class ChatWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _render_status(self, statuses: Dict[str, str], last_error: str) -> None:
+        if self.transport.mode == "dns":
+            live = set(self.transport.dns_ips)
+            statuses = {k: v for k, v in statuses.items() if k in live}
         values = list(statuses.values())
         ok_count = sum(1 for s in values if s == "ok")
         total_count = len(values)
