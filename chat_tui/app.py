@@ -29,9 +29,9 @@ from rich.rule import Rule
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual import events
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 # Tunable parameters for poor or unstable networks.
 SSH_CONNECT_TIMEOUT = 45
@@ -674,14 +674,7 @@ class StatusPanel(Static):
                 color = "yellow" if state == "unknown" else ("green" if state == "ok" else "red")
                 age = self._format_age((ages or {}).get(label))
                 line = f"[{color}]{label}: {age}[/{color}]"
-                if state == "fail" and mode == "DNS":
-                    line += f" [@click=\"remove_dns('{label}')\"][bold red]\\[x][/bold red][/]"
                 lines.append(line)
-        if mode == "DNS":
-            lines += [""]
-            lines.append("[@click=\"start_scan()\"][bold cyan]\\[ Scan ][/bold cyan][/]")
-            if scanner_text:
-                lines.append(f"[dim]{scanner_text}[/dim]")
         if last_error:
             lines += ["", "[bold]Last Error[/]", f"[red]{last_error}[/red]"]
         self.update("\n".join(lines))
@@ -745,12 +738,52 @@ class ChatView(Static):
         padding: 1 2;
         border: solid $primary;
     }
-    #status {
+    #sidebar {
         width: 28;
         height: 1fr;
         padding: 1;
         border: solid $primary;
         background: $surface-darken-1;
+        layout: vertical;
+    }
+    #status {
+        height: auto;
+    }
+    #dns-btns {
+        height: auto;
+        layout: vertical;
+        padding: 0;
+    }
+    .dns-x-btn {
+        height: 1;
+        min-width: 8;
+        width: auto;
+        margin: 0;
+        padding: 0;
+        background: darkred;
+        color: white;
+        border: none;
+        text-style: bold;
+    }
+    .dns-x-btn:hover {
+        background: red;
+    }
+    #scan-btn {
+        height: 1;
+        min-width: 10;
+        width: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: darkcyan;
+        color: white;
+        border: none;
+    }
+    #scan-btn:hover {
+        background: cyan;
+    }
+    #scan-status {
+        height: auto;
+        padding: 0;
     }
     #input-area {
         height: auto;
@@ -863,12 +896,6 @@ class ChatView(Static):
         if pending:
             body.append(" (pending)", style="yellow")
         self.chat_area.write(body)
-
-    def action_remove_dns(self, ip: str) -> None:
-        asyncio.create_task(self._remove_dns_link(ip))
-
-    def action_start_scan(self) -> None:
-        self._start_scan()
 
     def _scanner_status_text(self) -> str:
         if self.transport.mode != "dns":
@@ -999,7 +1026,11 @@ class ChatView(Static):
 
     def compose(self) -> ComposeResult:
         with Container(id="main"):
-            yield StatusPanel(id="status")
+            with Vertical(id="sidebar"):
+                yield StatusPanel(id="status")
+                yield Vertical(id="dns-btns")
+                yield Button("Scan", id="scan-btn")
+                yield Static("", id="scan-status")
             yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
@@ -1010,6 +1041,14 @@ class ChatView(Static):
         self.status_panel = self.query_one("#status", StatusPanel)
         self.transfer_status = self.query_one("#transfer-status", Static)
         self.input_w = self.query_one("#msg-input", Input)
+        self.dns_btns_container = self.query_one("#dns-btns", Vertical)
+        self.scan_btn = self.query_one("#scan-btn", Button)
+        self.scan_status_w = self.query_one("#scan-status", Static)
+        self._last_failed_ips: set = set()
+        if self.transport.mode != "dns":
+            self.scan_btn.display = False
+            self.dns_btns_container.display = False
+            self.scan_status_w.display = False
         for line in self.startup_lines:
             self.write_system(line)
         self._render_status_panel(self.transport.status)
@@ -1024,8 +1063,29 @@ class ChatView(Static):
             statuses,
             self.transport.last_error,
             ages,
-            scanner_text=self._scanner_status_text(),
         )
+        if self.transport.mode == "dns":
+            self._update_dns_buttons(statuses)
+            scanner_text = self._scanner_status_text()
+            self.scan_status_w.update(f"[dim]{scanner_text}[/dim]" if scanner_text else "")
+
+    def _update_dns_buttons(self, statuses: Dict[str, str]) -> None:
+        failed = {ip for ip, state in statuses.items() if state == "fail"}
+        if failed == self._last_failed_ips:
+            return
+        self._last_failed_ips = failed
+        self.dns_btns_container.remove_children()
+        for ip in sorted(failed):
+            btn = Button(f"[x] {ip}", id=f"dns-x-{ip.replace('.', '_')}", classes="dns-x-btn")
+            btn.dns_ip = ip
+            self.dns_btns_container.mount(btn)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "scan-btn":
+            self._start_scan()
+            return
+        if hasattr(event.button, "dns_ip"):
+            asyncio.create_task(self._remove_dns_link(event.button.dns_ip))
 
     async def refresh_now(self) -> None:
         try:
