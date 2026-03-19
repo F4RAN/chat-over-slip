@@ -832,8 +832,8 @@ class ChatView(Static):
 
     def compose(self) -> ComposeResult:
         with Container(id="main"):
-            yield RichLog(id="chat-area", wrap=True, markup=True)
             yield StatusPanel(id="status")
+            yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
             yield UploadInput(placeholder="Type message. Commands: /clear /upload /download /news", id="msg-input")
