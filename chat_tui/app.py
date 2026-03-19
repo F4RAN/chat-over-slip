@@ -719,26 +719,23 @@ class ChatView(Static):
         return False
 
     def _rtl_wrap(self, text: str) -> Text:
-        """Return right-justified Text with LRM anchors to stay inside the panel.
+        """Return visually-ordered RTL text that stays inside the panel.
 
-        Terminal bidi algorithms determine paragraph direction from the first
-        strong character on each *terminal* line.  Rich Panel borders (│) and
-        padding spaces are bidi-neutral, so the first strong char is the RTL
-        text itself – the terminal sets RTL paragraph direction and pushes
-        the content to the right edge of the terminal, overflowing the panel.
-
-        Fix: prepend U+200E LEFT-TO-RIGHT MARK (invisible, zero-width) at the
-        start of every logical line.  The terminal sees LRM as the first strong
-        character → LTR paragraph direction → RTL text stays embedded inside
-        the panel.  We also pre-wrap text with textwrap so Rich doesn't
-        re-wrap lines and lose the per-line LRM anchors.
+        Strategy: convert RTL text to visual order with python-bidi, then
+        wrap each line in LRO (Left-to-Right Override) + PDF (Pop Directional
+        Format).  LRO forces the terminal to treat ALL characters as LTR,
+        preventing the bidi algorithm from re-reversing the already visual-
+        order text.  This keeps content inside the panel AND preserves correct
+        RTL reading order.
         """
         if not text:
             return Text.from_markup("")
         if not self._has_rtl(text):
             return Text.from_markup(text)
         import textwrap
-        LRM = "\u200E"
+        from bidi.algorithm import get_display
+        LRO = "\u202D"   # Left-to-Right Override
+        PDF = "\u202C"   # Pop Directional Formatting
         # Compute available width from terminal width minus all overhead:
         # status panel (28) + chat border (2) + chat padding (4) +
         # panel border (2) + panel padding (2) + scrollbar (2) = 40
@@ -751,9 +748,11 @@ class ChatView(Static):
         for para in plain.split("\n"):
             if para.strip():
                 filled = textwrap.fill(para, width=max_w)
-                # Anchor each wrapped line with LRM to force LTR paragraph dir.
                 for line in filled.split("\n"):
-                    result_lines.append(LRM + line)
+                    # Convert to visual order, then lock LTR so terminal
+                    # doesn't re-reverse the RTL character runs.
+                    visual = get_display(line)
+                    result_lines.append(LRO + visual + PDF)
             else:
                 result_lines.append("")
         t = Text("\n".join(result_lines))
