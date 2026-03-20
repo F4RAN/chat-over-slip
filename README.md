@@ -4,6 +4,74 @@ Terminal and desktop chat over **SSH** or **DNS tunneling** (dnstt / [Slipstream
 
 ---
 
+## How the application works
+
+Every client is a **local UI** that drives a **remote message log** on your server. The remote side is a normal directory containing [`chat.sh`](chat.sh) (append/read/clear messages, optional Telegram hooks, news import, etc.). The client does not open a custom protocol port to the internet for chat—it uses **SSH** (directly or through a tunnel) to run `bash …/chat.sh -r`, `-n`, and related commands on that host.
+
+You pick a **mode** when connecting:
+
+| Mode | When to use | What SSH does |
+|------|----------------|---------------|
+| **SSH** | You can reach the server’s SSH port over the normal network | `ssh user@host` to the real IP/hostname |
+| **DNS** | Traffic must go through a DNS tunnel (Slipstream, dnstt, …) | `ssh user@<tunnel-domain>` with `ProxyCommand nc 127.0.0.1 <local-port>` so traffic enters the tunnel client listening on localhost |
+
+### SSH mode
+
+- You enter **host** (IP or DNS name), **user**, **password**, display name, and the **remote path** to `chat.sh` (default in code is `~/chat-over-dnstt/chat.sh`—adjust to match your server layout).
+- The client uses **`sshpass` + `ssh`** (and **`scp`** for file transfer) with keepalives and retries tuned for flaky links (see [`chat_common/transport.py`](chat_common/transport.py)).
+
+### DNS (tunnel) mode
+
+- You configure the **tunnel domain** (the name your DNS tunnel is published under), **SSH user/password** for the machine *behind* the tunnel, a local **tunnel client** ([Slipstream](#slipstream-tunnel-server--client) or [dnstt](#dnstt-classic-tunnel)), and one or more **resolver IPs** (or a file that lists them).
+- For each chosen resolver, the **launcher** can start **`slipstream-client`** pointing at that resolver; the same SSH+`nc` pattern works if you run **dnstt** (or another client) yourself and bind a local TCP port. SSH is then opened **through** `ProxyCommand nc 127.0.0.1:<port>` while the SSH target remains `user@tunnel-domain`.
+- The chat transport can track **multiple resolver/IP links** and retry or restart failed tunnel processes (see [`ChatTransport`](chat_common/transport.py) with `mode="dns"`).
+
+### Resolver scanner
+
+[`scanner.py`](scanner.py) is an **optional helper**: give it a text file of candidate resolver IPs (one per line). It probes many IPs in parallel and writes a **`result.txt`**-style log with lines like `IP: … - Time: …s` for endpoints where the probe sees a successful tunnel bring-up.
+
+- The **launcher** and DNS UI can **load** that file (or merge with `scanner-result.txt`) to populate the IP list you toggle before connect.
+- The script shipped here is still wired for a **dnstt + SSH** probe command inside the file; if you use **only Slipstream**, run your own discovery or edit the probe block to match your client binary and flags.
+
+### Frontends
+
+| Piece | Role |
+|-------|------|
+| [`chat_tui/`](chat_tui/) | Full-screen **Textual** chat (TUI); SSH and DNS modes, file send, news, online presence, DNS link UI. |
+| [`desktop_ui/`](desktop_ui/) | **Qt** desktop app with the same transport behavior. |
+| [`launcher/`](launcher/) | **Textual launcher**: choose **Direct SSH** vs **DNSTT (Slipstream)**, fill the form, optional file picker + **Scan** button, then opens the embedded chat. |
+| [`gui/`](gui/) | **Electron** UI; same SSH vs DNS idea—see [`gui/README.md`](gui/README.md). |
+
+### TUI preview (DNS mode)
+
+The main chat UI is a **Textual** TUI. In **DNS** mode the sidebar lists each resolver **link** (IP and last-seen state), **Scan** runs the resolver scanner, and the log shows each **Slipstream** client binding a local port (`127.0.0.1:8000`, …) before messages flow.
+
+![DNS mode: links, Scan, and Slipstream startup log](docs/images/launcher-dns-mode.png)
+
+### Command tutorial (TUI chat input)
+
+Use the bottom input (`Type a message…`). **Enter** sends. Commands start with `/` (see also **`/help`** in-app).
+
+| Command | Usage | What it does |
+|--------|--------|----------------|
+| `/help` | | List commands in the chat log. |
+| `/clear` | | Clears the **remote** message log via `chat.sh -c` (SSH: single connection; DNS: uses the first link that succeeds). Also wipes the **local** TUI view. **Destructive** for everyone using that server log. |
+| `/upload` | `/upload /path/to/file` | Upload a file over **scp** to the server next to `chat.sh`. You can also type a **single absolute path** to an existing file on one line (no `/upload`) and it is treated as an upload. |
+| `/download` | `/download <name>` | Download a file that was shared in chat (matches a recent `[file] name::path` line). |
+| `/news` | `/news <channel> [range]` | Pull messages from a Telegram channel via [`tg_news.py`](tg_news.py) on the server; `range` is a count (default `10`) or `START-END` style range. Requires `TG_NEWS_API_ID` / `TG_NEWS_API_HASH` in [`.env`](.env.example). |
+| `/scan` | `/scan` or `/scan /path/to/ips.txt` | **DNS mode only** — runs [`scanner.py`](scanner.py) (`-f` input, `-o` session output). If you omit the path, the client uses the **scanner input file** from your session (e.g. set in the launcher); if that file is missing, you’ll get an error—use `/scan /absolute/path/to/ips.txt`. Newly found IPs can be added as links automatically. |
+| `/dns-remove` | `/dns-remove <ip>` | Drop a **DNS link** that is down so the client stops using that resolver. |
+| `/emoji` | `/emoji` or `/emoji <name>` | With no argument, show the emoji table. With a **name**, **number** (1-based), or partial name, insert that emoji into the input (useful before sending). |
+
+Footer shortcuts depend on the screen (e.g. **Esc** back, **q** quit, **Ctrl+P** command palette where enabled).
+
+### Client machine prerequisites
+
+- **`sshpass`** and **`nc`** (OpenBSD netcat) on `PATH` for the SSH/ProxyCommand paths the code expects.
+- **DNS mode:** a tunnel client that exposes a **local TCP port** to the tunnel—typically **`slipstream-client`** (see [`slipstream/`](slipstream/) or build from [slipstream-rust](https://github.com/Mygod/slipstream-rust)) or **`dnstt`** (see [dnstt](#dnstt-classic-tunnel)).
+
+---
+
 ## This repo (quick)
 
 **Chat server:** clone on the host, copy [`.env.example`](.env.example) → `.env` if you use Telegram helpers (`tg_*.py`), and use [`chat.sh`](chat.sh) as the shared message backend from the directory your clients expect.
@@ -64,6 +132,10 @@ cargo run -p slipstream-client -- \
 
 You can use a resolver that forwards to your Slipstream server. Then point this repo’s SSH/DNS mode at `127.0.0.1:7000` (or the port you chose) as documented in your client config.
 
+### dnstt (classic tunnel)
+
+[dnstt](https://github.com/getlantern/dnstt) (and other implementations of the same idea) is the classic DNS tunnel this project was originally built around. It is still a valid option: run **`dnstt-client`** so it forwards to a local port, then use the same **SSH + `ProxyCommand nc 127.0.0.1:<port>`** setup as with Slipstream. The bundled [`scanner.py`](scanner.py) probe logic is written for **dnstt** today; Slipstream users often start the client from the launcher or by hand.
+
 ### Production: conntrack (UDP / DNS on port 53)
 
 On a public server handling many DNS flows, raise conntrack limits above typical defaults. Upstream suggests a baseline such as:
@@ -81,6 +153,26 @@ Rough sizing: ~131072 entries per 1 GiB RAM, ~262144 for 2–4 GiB, ~524288 
 ## Bundled client binary
 
 This repository may include a prebuilt [`slipstream/slipstream-client`](slipstream/slipstream-client) (and release zips may ship platform-named copies). Prefer matching the version/build against your server; when in doubt, build both from the same [slipstream-rust](https://github.com/Mygod/slipstream-rust) revision.
+
+---
+
+## Known limitations
+
+1. **Encryption** — Chat content is only protected by whatever the transport provides (e.g. SSH). There is **no application-level end-to-end encryption** of messages on disk or in the UI layer. Stronger crypto here would be a valuable addition.
+2. **Windows** — The stack is built around Unix-style tools (`sshpass`, `nc`, shell, optional pty). **Windows is not a first-class target** yet. Contributions to document or port the client (WSL2, native OpenSSH, installer) are welcome.
+3. **Primary UI** — The **main experience is the TUI** ([`chat_tui/`](chat_tui/)); it works but **needs UX and reliability polish**. Qt, Electron, and the launcher are secondary paths.
+4. **Slipstream vs dnstt** — **Slipstream** is the path we document and automate most clearly (launcher, releases). **dnstt** remains supported at the architecture level (local TCP port + SSH `ProxyCommand`), and [`scanner.py`](scanner.py) still targets dnstt-style probes; first-class dnstt parity in the launcher would help.
+
+---
+
+## Design ideas (not implemented)
+
+These are directions discussed for **censorship / DPI** and **robustness**; they are not how the client behaves today.
+
+1. **Short-lived tunnels + one SSH per operation** — Deep-packet inspection often targets **long-lived DNS streams**. A possible approach: keep each DNS tunnel session **very short**, run **one remote `chat.sh` invocation per SSH connection**, then tear down SSH and the tunnel before starting the next. That trades latency and overhead for a smaller observable fingerprint.
+2. **Fan-out across resolvers** — For robustness under lossy paths: **send the same logical operation through every configured DNS link in parallel** and **accept the first successful (or fastest) response**, discarding duplicates. Today the transport uses multiple links mainly for failover/restart rather than strict racing.
+
+---
 
 ## License
 
