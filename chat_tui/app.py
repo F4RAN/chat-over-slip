@@ -936,11 +936,15 @@ class InputLine(Static):
 
     DEFAULT_CSS = """
     InputLine {
-        height: 1;
+        height: 3;
         width: 1fr;
-        background: $boost;
+        background: #1a1a2e;
         color: $text;
-        padding: 0 1;
+        padding: 1 2;
+        border: tall #3a3a5c;
+    }
+    InputLine:focus-within {
+        border: tall $accent;
     }
     """
 
@@ -949,20 +953,20 @@ class InputLine(Static):
         self._placeholder = placeholder
         self._text = ""
         self._cursor_pos = 0
+        self.update(f"[#555580]{escape(self._placeholder)}[/]")
 
     def refresh_text(self, text: str, cursor_pos: int) -> None:
         """Update display. Called from event loop via call_soon_threadsafe."""
         self._text = text
         self._cursor_pos = cursor_pos
-        prompt = "[bold cyan]>[/bold cyan] "
         if not text:
-            self.update(f"{prompt}[dim]{escape(self._placeholder)}[/dim]")
+            self.update(f"[#555580]{escape(self._placeholder)}[/]")
         else:
             # Show text with a visible cursor position
             left = escape(text[:cursor_pos])
             cursor_ch = escape(text[cursor_pos]) if cursor_pos < len(text) else " "
             right = escape(text[cursor_pos + 1:]) if cursor_pos < len(text) else ""
-            self.update(f"{prompt}{left}[reverse]{cursor_ch}[/reverse]{right}")
+            self.update(f"{left}[reverse bold]{cursor_ch}[/reverse bold]{right}")
 
 
 def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, display_widget: InputLine) -> None:
@@ -1220,13 +1224,18 @@ class ChatView(Static):
     #input-area {
         height: auto;
         layout: vertical;
-        padding: 0 2 0 2;
-        border: round $primary;
+        padding: 0 1;
+        margin: 0 0;
+    }
+    #input-label {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
     }
     #transfer-status {
         height: auto;
-        min-height: 1;
-        padding: 0 0 1 0;
+        min-height: 0;
+        padding: 0 1;
     }
     """
 
@@ -1485,7 +1494,8 @@ class ChatView(Static):
                 yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
-            yield InputLine(placeholder="Type a message... (/help for commands)", id="msg-input")
+            yield Static("[dim]Message · /help for commands[/dim]", id="input-label")
+            yield InputLine(placeholder="Type a message...", id="msg-input")
 
     def on_mount(self) -> None:
         self.chat_area = self.query_one("#chat-area", RichLog)
