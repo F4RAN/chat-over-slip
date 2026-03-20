@@ -975,9 +975,29 @@ def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queu
     driver = app._driver
     if driver is None:
         return
+    original_process = driver.process_message
     original_send = driver.send_message
     _last_refresh = [0.0]  # mutable for closure
     _REFRESH_INTERVAL = 0.03  # 30ms throttle for display updates
+
+    # Debug logging: set SISH_KBD_DEBUG=1 to trace character flow
+    _debug = os.environ.get("SISH_KBD_DEBUG") == "1"
+    _dbg_file = None
+    if _debug:
+        try:
+            _dbg_file = open("/tmp/sish_kbd.log", "a")
+            _dbg_file.write(f"--- patch applied at {time.time():.3f} ---\n")
+            _dbg_file.flush()
+        except Exception:
+            _dbg_file = None
+
+    def _dbg(msg: str) -> None:
+        if _dbg_file:
+            try:
+                _dbg_file.write(f"{time.monotonic():.4f} {msg}\n")
+                _dbg_file.flush()
+            except Exception:
+                pass
 
     def _schedule_display_refresh() -> None:
         now = time.monotonic()
@@ -992,6 +1012,7 @@ def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queu
 
     def _submit_line() -> None:
         line = buf.submit()
+        _dbg(f"SUBMIT: {line!r}")
         # Always refresh display immediately on Enter (shows cleared input)
         _last_refresh[0] = 0
         _schedule_display_refresh()
@@ -1000,43 +1021,78 @@ def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queu
         except RuntimeError:
             pass
 
-    def patched_send(message) -> None:
+    def _handle_key(message: events.Key) -> bool:
+        """Handle a Key event in the driver thread. Returns True if handled."""
+        key = message.key
+        char = message.character
+        _dbg(f"KEY: key={key!r} char={char!r} printable={message.is_printable}")
+
+        if key == "enter":
+            _submit_line()
+            return True
+        elif key == "backspace":
+            buf.backspace()
+        elif key == "delete":
+            buf.delete()
+        elif key == "left":
+            buf.cursor_left()
+        elif key == "right":
+            buf.cursor_right()
+        elif key == "home":
+            buf.home()
+        elif key == "end":
+            buf.end()
+        elif key == "up":
+            buf.history_up()
+        elif key == "down":
+            buf.history_down()
+        elif key == "ctrl+u":
+            buf.ctrl_u()
+        elif char and char.isprintable():
+            # Accept ANY character that is printable — don't rely on
+            # message.is_printable which returns False when character
+            # was set to None by the XTermParser for CSI u sequences.
+            buf.insert(char)
+        elif message.is_printable and not char:
+            # Kitty keyboard protocol: character is None but key contains
+            # the character name.  Extract it.
+            if len(key) == 1:
+                buf.insert(key)
+            elif "+" in key:
+                # e.g. "shift+h" → 'H', "shift+1" → '!'
+                parts = key.split("+")
+                base = parts[-1]
+                if len(base) == 1:
+                    ch = base.upper() if "shift" in parts else base
+                    buf.insert(ch)
+                else:
+                    _dbg(f"FORWARD (unhandled key name): {key!r}")
+                    return False
+            else:
+                _dbg(f"FORWARD (non-printable): {key!r}")
+                return False
+        else:
+            # Non-input keys (ctrl+c, tab, etc.) — forward to event loop
+            _dbg(f"FORWARD: {key!r}")
+            return False
+        _schedule_display_refresh()
+        return True
+
+    def patched_process(message) -> None:
+        """Intercept Key/Paste events at the process_message level —
+        BEFORE Driver.process_message does any processing."""
         # Key events: handle in this thread (driver's input thread)
         if isinstance(message, events.Key):
-            key = message.key
-            if key == "enter":
-                _submit_line()
-                return  # don't forward to event loop
-            elif key == "backspace":
-                buf.backspace()
-            elif key == "delete":
-                buf.delete()
-            elif key == "left":
-                buf.cursor_left()
-            elif key == "right":
-                buf.cursor_right()
-            elif key == "home":
-                buf.home()
-            elif key == "end":
-                buf.end()
-            elif key == "up":
-                buf.history_up()
-            elif key == "down":
-                buf.history_down()
-            elif key == "ctrl+u":
-                buf.ctrl_u()
-            elif message.is_printable and message.character:
-                buf.insert(message.character)
-            else:
-                # Non-input keys (ctrl+c, tab, etc.) — forward to event loop
-                original_send(message)
-                return
-            _schedule_display_refresh()
-            return  # handled, don't forward
+            if _handle_key(message):
+                return  # handled, don't forward
+            # Forward unhandled keys through original path
+            original_process(message)
+            return
 
         # Paste events: buffer the text, don't forward
         if isinstance(message, events.Paste):
             text = message.text or ""
+            _dbg(f"PASTE: {text!r}")
             buf.paste(text)
             # Auto-detect file paths on paste (runs in driver thread — safe)
             pasted = text.strip()
@@ -1050,10 +1106,12 @@ def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queu
             _schedule_display_refresh()
             return
 
-        # Everything else (mouse, resize, etc.) — forward normally
-        original_send(message)
+        # Everything else (mouse, resize, etc.) — forward through original path
+        original_process(message)
 
-    driver.send_message = patched_send
+    # Patch at process_message level — intercepts events before Driver.process_message
+    driver.process_message = patched_process
+    _dbg(f"Patched driver.process_message (type={type(driver).__name__})")
 
 
 class ChatView(Static):
