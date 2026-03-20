@@ -301,12 +301,13 @@ class DNSTTScreen(Static):
 class ChatSessionScreen(Screen):
     BINDINGS = [Binding("escape", "back", "Back")]
 
-    def __init__(self, config: dict, startup_lines: Optional[list[str]] = None):
+    def __init__(self, config: dict, startup_lines: Optional[list[str]] = None, state_path: Optional[Path] = None):
         super().__init__()
         self.config = config
         self.startup_lines = startup_lines or []
         self.slip_procs = []
         self.chat_view: Optional[ChatView] = None
+        self.state_path = state_path
 
     def _on_restart_link(self, ip: str, port: int) -> None:
         """Restart slipstream process for a DNS link that got 'unknown port 65535'."""
@@ -363,6 +364,25 @@ class ChatSessionScreen(Screen):
             start_new_session=True,
         )
         self.slip_procs.append(proc)
+        # Mark the IP as ready so it participates in the transport race.
+        if self.chat_view:
+            self.chat_view.transport.ready_ips.add(ip)
+        # Persist the updated DNS list for future app runs.
+        self._persist_dns_list()
+
+    def _persist_dns_list(self) -> None:
+        """Save current DNS IPs and ports to launcher state for future runs."""
+        if not self.state_path or not self.chat_view:
+            return
+        try:
+            state = load_launcher_state(self.state_path)
+            if "dns" not in state:
+                state["dns"] = {}
+            state["dns"]["active_dns_ips"] = list(self.chat_view.transport.dns_ips)
+            state["dns"]["active_proxy_ports"] = list(self.chat_view.transport.proxy_ports)
+            self.state_path.write_text(json.dumps(state, indent=2))
+        except Exception:
+            pass
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -383,6 +403,7 @@ class ChatSessionScreen(Screen):
             scanner_input_file=self.config.get("scanner_input_file", ""),
             on_new_dns_ip=self._on_new_dns_ip,
             on_restart_link=self._on_restart_link,
+            on_dns_list_changed=self._persist_dns_list,
         )
         yield self.chat_view
         yield Footer()
@@ -529,7 +550,8 @@ class LauncherApp(App):
                     "password": v["password"],
                     "name": v.get("name"),
                     "remote_script": v["remote_script"],
-                }
+                },
+                state_path=self.state_path,
             )
         )
 
@@ -547,6 +569,14 @@ class LauncherApp(App):
         if self.state_path:
             save_launcher_state(self.state_path, v)
         base_port = 8000
+        # Merge previously persisted IPs (from scanner) that aren't already selected.
+        dns_ips = list(v["ips"])
+        if self.state_path:
+            saved = load_launcher_state(self.state_path)
+            saved_ips = saved.get("dns", {}).get("active_dns_ips", [])
+            for ip in saved_ips:
+                if ip not in dns_ips:
+                    dns_ips.append(ip)
         self.push_screen(
             ChatSessionScreen(
                 {
@@ -557,14 +587,15 @@ class LauncherApp(App):
                     "password": v["password"],
                     "name": v.get("name"),
                     "remote_script": v["remote_script"],
-                    "dns_ips": v["ips"],
-                    "proxy_ports": [base_port + index for index in range(len(v["ips"]))],
+                    "dns_ips": dns_ips,
+                    "proxy_ports": [base_port + index for index in range(len(dns_ips))],
                     "scanner_input_file": v.get("scanner_input_file", ""),
                 },
                 startup_lines=[
                     "Preparing DNSTT chat session...",
-                    f"Using {len(v['ips'])} DNS link(s).",
+                    f"Using {len(dns_ips)} DNS link(s).",
                 ],
+                state_path=self.state_path,
             )
         )
 
