@@ -939,9 +939,11 @@ class InputLine(Static):
         height: auto;
         min-height: 1;
         width: 1fr;
-        background: #1e1e2e;
+        background: #282840;
         color: $text;
         padding: 0 1;
+        margin: 0 1;
+        border: round #3a3a5c;
     }
     """
 
@@ -1157,7 +1159,7 @@ class ChatView(Static):
     #chat-area {
         width: 1fr;
         height: 1fr;
-        padding: 0 2;
+        padding: 0 1;
         border: solid $primary;
     }
     #sidebar {
@@ -1220,8 +1222,9 @@ class ChatView(Static):
     #input-area {
         height: auto;
         layout: vertical;
-        padding: 0 2;
+        padding: 0 1;
         background: #1e1e2e;
+        border-top: hkey #3a3a5c;
     }
     #transfer-status {
         height: auto;
