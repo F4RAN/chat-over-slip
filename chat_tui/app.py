@@ -810,6 +810,249 @@ class UploadInput(Input):
         super()._on_paste(event)
 
 
+# ---------------------------------------------------------------------------
+# Standalone keyboard input — runs entirely in the driver's input thread,
+# bypassing the Textual event loop for every keystroke.  Only completed
+# lines (Enter) are injected into the event loop via call_soon_threadsafe.
+# ---------------------------------------------------------------------------
+
+class InputBuffer:
+    """Thread-safe line buffer with basic editing, used from the driver thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._chars: list[str] = []  # characters left of cursor
+        self._right: list[str] = []  # characters right of cursor
+        self._history: list[str] = []
+        self._history_idx = -1
+        self._saved_current = ""
+
+    # -- editing (called from driver thread) --------------------------------
+
+    def insert(self, ch: str) -> None:
+        with self._lock:
+            self._chars.append(ch)
+
+    def backspace(self) -> None:
+        with self._lock:
+            if self._chars:
+                self._chars.pop()
+
+    def delete(self) -> None:
+        with self._lock:
+            if self._right:
+                self._right.pop(0)
+
+    def cursor_left(self) -> None:
+        with self._lock:
+            if self._chars:
+                self._right.insert(0, self._chars.pop())
+
+    def cursor_right(self) -> None:
+        with self._lock:
+            if self._right:
+                self._chars.append(self._right.pop(0))
+
+    def home(self) -> None:
+        with self._lock:
+            self._right = self._chars + self._right
+            self._chars = []
+
+    def end(self) -> None:
+        with self._lock:
+            self._chars = self._chars + self._right
+            self._right = []
+
+    def history_up(self) -> None:
+        with self._lock:
+            if not self._history:
+                return
+            if self._history_idx == -1:
+                self._saved_current = "".join(self._chars) + "".join(self._right)
+                self._history_idx = len(self._history) - 1
+            elif self._history_idx > 0:
+                self._history_idx -= 1
+            else:
+                return
+            line = self._history[self._history_idx]
+            self._chars = list(line)
+            self._right = []
+
+    def history_down(self) -> None:
+        with self._lock:
+            if self._history_idx == -1:
+                return
+            if self._history_idx < len(self._history) - 1:
+                self._history_idx += 1
+                line = self._history[self._history_idx]
+            else:
+                self._history_idx = -1
+                line = self._saved_current
+            self._chars = list(line)
+            self._right = []
+
+    def ctrl_u(self) -> None:
+        """Kill line (clear everything left of cursor)."""
+        with self._lock:
+            self._chars = []
+
+    def submit(self) -> str:
+        """Return the current line and reset the buffer."""
+        with self._lock:
+            line = "".join(self._chars) + "".join(self._right)
+            if line.strip():
+                self._history.append(line)
+            self._chars = []
+            self._right = []
+            self._history_idx = -1
+            self._saved_current = ""
+            return line
+
+    def paste(self, text: str) -> None:
+        """Insert pasted text (may contain multiple chars)."""
+        with self._lock:
+            for ch in text:
+                if ch == "\n":
+                    continue  # ignore newlines in paste, Enter is separate
+                self._chars.append(ch)
+
+    def display(self) -> tuple[str, int]:
+        """Return (full_text, cursor_position) for rendering."""
+        with self._lock:
+            text = "".join(self._chars) + "".join(self._right)
+            return text, len(self._chars)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._chars = []
+            self._right = []
+
+
+class InputLine(Static):
+    """Displays the current InputBuffer content with a cursor indicator."""
+
+    DEFAULT_CSS = """
+    InputLine {
+        height: 1;
+        width: 1fr;
+        background: $surface;
+        color: $text;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, placeholder: str = "", **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._placeholder = placeholder
+        self._text = ""
+        self._cursor_pos = 0
+
+    def refresh_text(self, text: str, cursor_pos: int) -> None:
+        """Update display. Called from event loop via call_soon_threadsafe."""
+        self._text = text
+        self._cursor_pos = cursor_pos
+        if not text:
+            self.update(f"[dim]{escape(self._placeholder)}[/dim]")
+        else:
+            # Show text with a visible cursor position
+            left = escape(text[:cursor_pos])
+            cursor_ch = escape(text[cursor_pos]) if cursor_pos < len(text) else " "
+            right = escape(text[cursor_pos + 1:]) if cursor_pos < len(text) else ""
+            self.update(f"{left}[reverse]{cursor_ch}[/reverse]{right}")
+
+
+def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, display_widget: InputLine) -> None:
+    """Monkey-patch the app's driver so Key/Paste events are handled in the
+    driver's input thread instead of the event loop.
+
+    Only Enter (completed lines) are forwarded to the event loop.
+    The InputLine widget is refreshed via call_soon_threadsafe with
+    throttling (~30ms) so we never flood the event loop.
+    """
+    driver = app._driver
+    if driver is None:
+        return
+    original_send = driver.send_message
+    _last_refresh = [0.0]  # mutable for closure
+    _REFRESH_INTERVAL = 0.03  # 30ms throttle for display updates
+
+    def _schedule_display_refresh() -> None:
+        now = time.monotonic()
+        if now - _last_refresh[0] < _REFRESH_INTERVAL:
+            return
+        _last_refresh[0] = now
+        text, cursor = buf.display()
+        try:
+            loop.call_soon_threadsafe(display_widget.refresh_text, text, cursor)
+        except RuntimeError:
+            pass  # loop closed
+
+    def _submit_line() -> None:
+        line = buf.submit()
+        # Always refresh display immediately on Enter (shows cleared input)
+        _last_refresh[0] = 0
+        _schedule_display_refresh()
+        try:
+            loop.call_soon_threadsafe(line_queue.put_nowait, line)
+        except RuntimeError:
+            pass
+
+    def patched_send(message) -> None:
+        # Key events: handle in this thread (driver's input thread)
+        if isinstance(message, events.Key):
+            key = message.key
+            if key == "enter":
+                _submit_line()
+                return  # don't forward to event loop
+            elif key == "backspace":
+                buf.backspace()
+            elif key == "delete":
+                buf.delete()
+            elif key == "left":
+                buf.cursor_left()
+            elif key == "right":
+                buf.cursor_right()
+            elif key == "home":
+                buf.home()
+            elif key == "end":
+                buf.end()
+            elif key == "up":
+                buf.history_up()
+            elif key == "down":
+                buf.history_down()
+            elif key == "ctrl+u":
+                buf.ctrl_u()
+            elif message.is_printable and message.character:
+                buf.insert(message.character)
+            else:
+                # Non-input keys (ctrl+c, tab, etc.) — forward to event loop
+                original_send(message)
+                return
+            _schedule_display_refresh()
+            return  # handled, don't forward
+
+        # Paste events: buffer the text, don't forward
+        if isinstance(message, events.Paste):
+            text = message.text or ""
+            buf.paste(text)
+            # Auto-detect file paths on paste (runs in driver thread — safe)
+            pasted = text.strip()
+            if pasted and not pasted.startswith("/"):
+                upload = ChatView._detect_upload(pasted)
+                if upload:
+                    buf.clear()
+                    buf.paste(upload)
+                    _submit_line()
+                    return
+            _schedule_display_refresh()
+            return
+
+        # Everything else (mouse, resize, etc.) — forward normally
+        original_send(message)
+
+    driver.send_message = patched_send
+
+
 class ChatView(Static):
     DEFAULT_CSS = """
     ChatView {
@@ -1173,13 +1416,13 @@ class ChatView(Static):
                 yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
-            yield UploadInput(placeholder="Type message. Commands: /clear /upload /download /news", id="msg-input")
+            yield InputLine(placeholder="Type message. Commands: /clear /upload /download /news", id="msg-input")
 
     def on_mount(self) -> None:
         self.chat_area = self.query_one("#chat-area", RichLog)
         self.status_panel = self.query_one("#status", StatusPanel)
         self.transfer_status = self.query_one("#transfer-status", Static)
-        self.input_w = self.query_one("#msg-input", Input)
+        self.input_line = self.query_one("#msg-input", InputLine)
         self.dns_btns_container = self.query_one("#dns-btns", Vertical)
         self.scan_btn = self.query_one("#scan-btn", Button)
         self.scan_status_w = self.query_one("#scan-status", Static)
@@ -1198,6 +1441,13 @@ class ChatView(Static):
         asyncio.create_task(self.refresh_now())
         self.poll_task = asyncio.create_task(self._poll_loop())
         self._scan_timer = self.set_interval(2, self._poll_scanner, pause=True)
+
+        # -- Standalone keyboard: patch driver to intercept keys in its thread --
+        self._input_buf = InputBuffer()
+        self._line_queue: asyncio.Queue[str] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        _patch_driver_for_input(self.app, self._input_buf, self._line_queue, loop, self.input_line)
+        asyncio.create_task(self._line_consumer())
 
     def _render_status_panel(self, statuses: Dict[str, str]) -> None:
         is_dns = self.transport.mode == "dns"
@@ -1540,64 +1790,93 @@ class ChatView(Static):
         self.chat_area.write(f"[green]Removed offline DNS link[/]: {ip}")
         self._render_status_panel(self.transport.status)
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        event.input.value = ""
-        if not text:
-            return
-        if isinstance(event.input, UploadInput) and not text.startswith("/upload "):
-            upload_command = event.input.as_upload_command(text)
-            if upload_command:
-                text = upload_command
-        if text == "/clear":
-            await self._clear_chat()
-            return
-        if text.startswith("/news "):
-            parts = text.split(maxsplit=2)
-            if len(parts) < 2:
-                self.chat_area.write("[red]News failed[/]: usage /news ChannelName 10 or /news ChannelName 20-10 or /news ChannelName 20 10")
-                return
-            channel = parts[1].strip()
-            range_spec = parts[2].strip() if len(parts) > 2 else "10"
-            if not channel:
-                self.chat_area.write("[red]News failed[/]: channel name required")
-                return
-            await self._fetch_news(channel, range_spec)
-            return
-        if text.startswith("/upload "):
-            await self._upload_file(text.split(" ", 1)[1].strip())
-            return
-        if text.startswith("/download "):
-            target = self._resolve_download_target(text.split(" ", 1)[1].strip())
-            if not target:
-                self.chat_area.write("[red]Download failed[/]: file not found in recent messages")
-                return
-            name, relative_path = target
-            await self._download_file(name, relative_path)
-            return
-        if text.startswith("/dns-remove "):
-            ip = text.split(" ", 1)[1].strip()
-            if not ip:
-                self.chat_area.write("[red]DNS remove failed[/]: usage /dns-remove <ip>")
-                return
-            await self._remove_dns_link(ip)
-            return
-        if text.startswith("/scan"):
-            parts = text.split(maxsplit=1)
-            input_file = parts[1].strip() if len(parts) > 1 else ""
-            self._start_scan(input_file)
-            return
-        await self._send_text(text)
+    async def _line_consumer(self) -> None:
+        """Read completed lines from the keyboard thread and dispatch."""
+        while True:
+            text = await self._line_queue.get()
+            text = text.strip()
+            if not text:
+                continue
+            # File-path detection (runs on event loop only once, on Enter)
+            if not text.startswith("/upload "):
+                upload = self._detect_upload(text)
+                if upload:
+                    text = upload
+            if text == "/clear":
+                await self._clear_chat()
+                continue
+            if text.startswith("/news "):
+                parts = text.split(maxsplit=2)
+                if len(parts) < 2:
+                    self.chat_area.write("[red]News failed[/]: usage /news ChannelName 10 or /news ChannelName 20-10 or /news ChannelName 20 10")
+                    continue
+                channel = parts[1].strip()
+                range_spec = parts[2].strip() if len(parts) > 2 else "10"
+                if not channel:
+                    self.chat_area.write("[red]News failed[/]: channel name required")
+                    continue
+                await self._fetch_news(channel, range_spec)
+                continue
+            if text.startswith("/upload "):
+                await self._upload_file(text.split(" ", 1)[1].strip())
+                continue
+            if text.startswith("/download "):
+                target = self._resolve_download_target(text.split(" ", 1)[1].strip())
+                if not target:
+                    self.chat_area.write("[red]Download failed[/]: file not found in recent messages")
+                    continue
+                name, relative_path = target
+                await self._download_file(name, relative_path)
+                continue
+            if text.startswith("/dns-remove "):
+                ip = text.split(" ", 1)[1].strip()
+                if not ip:
+                    self.chat_area.write("[red]DNS remove failed[/]: usage /dns-remove <ip>")
+                    continue
+                await self._remove_dns_link(ip)
+                continue
+            if text.startswith("/scan"):
+                parts = text.split(maxsplit=1)
+                input_file = parts[1].strip() if len(parts) > 1 else ""
+                self._start_scan(input_file)
+                continue
+            await self._send_text(text)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if not isinstance(event.input, UploadInput):
-            return
-        if event.value.startswith("/upload "):
-            return
-        upload_command = event.input.as_upload_command(event.value)
-        if upload_command and event.input.value != upload_command:
-            event.input.value = upload_command
-            event.input.cursor_position = len(upload_command)
+    @staticmethod
+    def _detect_upload(text: str) -> Optional[str]:
+        """Detect file paths — only called once on Enter, not per keystroke."""
+        _MAX_PATH_LEN = 260
+        line = text.strip()
+        if not line:
+            return None
+        if line.startswith("file://"):
+            parsed = urlparse(line)
+            candidate = unquote(parsed.path)
+            if not candidate or len(candidate) > _MAX_PATH_LEN:
+                return None
+            try:
+                if Path(candidate).expanduser().is_file():
+                    return f"/upload {candidate}"
+            except OSError:
+                pass
+            return None
+        if line.startswith("/") or len(line) > _MAX_PATH_LEN:
+            return None
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = [line]
+        if len(parts) != 1:
+            return None
+        candidate = str(Path(parts[0]).expanduser())
+        if len(candidate) > _MAX_PATH_LEN:
+            return None
+        try:
+            if Path(candidate).is_file():
+                return f"/upload {candidate}"
+        except OSError:
+            pass
+        return None
 
     def shutdown(self) -> None:
         if self.poll_task:
@@ -1615,7 +1894,7 @@ class ChatApp(App):
     }
     """
 
-    BINDINGS = [Binding("q", "quit", "Quit")]
+    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
 
     def __init__(self, transport: ChatTransport, display_name: str, scanner_input_file: str = ""):
         super().__init__()
