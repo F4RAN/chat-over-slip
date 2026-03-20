@@ -938,7 +938,7 @@ class InputLine(Static):
     InputLine {
         height: 1;
         width: 1fr;
-        background: $surface;
+        background: $boost;
         color: $text;
         padding: 0 1;
     }
@@ -954,14 +954,15 @@ class InputLine(Static):
         """Update display. Called from event loop via call_soon_threadsafe."""
         self._text = text
         self._cursor_pos = cursor_pos
+        prompt = "[bold cyan]>[/bold cyan] "
         if not text:
-            self.update(f"[dim]{escape(self._placeholder)}[/dim]")
+            self.update(f"{prompt}[dim]{escape(self._placeholder)}[/dim]")
         else:
             # Show text with a visible cursor position
             left = escape(text[:cursor_pos])
             cursor_ch = escape(text[cursor_pos]) if cursor_pos < len(text) else " "
             right = escape(text[cursor_pos + 1:]) if cursor_pos < len(text) else ""
-            self.update(f"{left}[reverse]{cursor_ch}[/reverse]{right}")
+            self.update(f"{prompt}{left}[reverse]{cursor_ch}[/reverse]{right}")
 
 
 def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, display_widget: InputLine) -> None:
@@ -1219,8 +1220,8 @@ class ChatView(Static):
     #input-area {
         height: auto;
         layout: vertical;
-        padding: 1 2;
-        border: solid $primary;
+        padding: 0 2 0 2;
+        border: round $primary;
     }
     #transfer-status {
         height: auto;
@@ -1237,6 +1238,7 @@ class ChatView(Static):
         scanner_input_file: str = "",
         on_new_dns_ip: Optional[Callable[[str, int], None]] = None,
         on_restart_link: Optional[Callable[[str, int], None]] = None,
+        on_dns_list_changed: Optional[Callable[[], None]] = None,
     ):
         super().__init__()
         self.transport = transport
@@ -1258,6 +1260,7 @@ class ChatView(Static):
         self._scan_timer = None
         self._on_new_dns_ip = on_new_dns_ip
         self._on_restart_link = on_restart_link
+        self._on_dns_list_changed = on_dns_list_changed
         self._restarting_links = False
         self._retrying_pending = False
         self._message_filter_mode = "all"
@@ -1412,10 +1415,13 @@ class ChatView(Static):
         self.transport.proxy_ports.append(new_port)
         self.transport.status[ip] = "unknown"
         self.transport.fail_counts[ip] = 0
+        self.transport.retry_counts[ip] = 0
         self.transport.last_online_at[ip] = None
         self.write_system(f"[green]Scanner found:[/] {ip}")
         if self._on_new_dns_ip:
             self._on_new_dns_ip(ip, new_port)
+        if self._on_dns_list_changed:
+            self._on_dns_list_changed()
 
     def _play_notification_sound(self) -> None:
         def _run() -> None:
@@ -1479,7 +1485,7 @@ class ChatView(Static):
                 yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
-            yield InputLine(placeholder="Type message. Commands: /clear /upload /download /news", id="msg-input")
+            yield InputLine(placeholder="Type a message... (/help for commands)", id="msg-input")
 
     def on_mount(self) -> None:
         self.chat_area = self.query_one("#chat-area", RichLog)
@@ -1952,6 +1958,8 @@ class ChatView(Static):
             return
         self.chat_area.write(f"[green]Removed offline DNS link[/]: {ip}")
         self._render_status_panel(self.transport.status)
+        if self._on_dns_list_changed:
+            self._on_dns_list_changed()
 
     async def _line_consumer(self) -> None:
         """Read completed lines from the keyboard thread and dispatch."""
@@ -2003,7 +2011,82 @@ class ChatView(Static):
                 input_file = parts[1].strip() if len(parts) > 1 else ""
                 self._start_scan(input_file)
                 continue
+            if text == "/emoji" or text.startswith("/emoji "):
+                self._show_emoji_picker(text)
+                continue
+            if text == "/help":
+                self._show_help()
+                continue
             await self._send_text(text)
+
+    EMOJI_TABLE = [
+        ("smile", "😀"), ("grin", "😁"), ("laugh", "😂"), ("rofl", "🤣"),
+        ("blush", "😊"), ("heart_eyes", "😍"), ("kiss", "😘"), ("cool", "😎"),
+        ("think", "🤔"), ("eyeroll", "🙄"), ("sleep", "😴"), ("mind_blown", "🤯"),
+        ("cry", "😭"), ("angry", "😡"), ("thumbsup", "👍"), ("thumbsdown", "👎"),
+        ("clap", "👏"), ("pray", "🙏"), ("heart", "❤️"), ("fire", "🔥"),
+        ("party", "🎉"), ("100", "💯"), ("check", "✅"), ("cross", "❌"),
+        ("rose", "🌹"), ("star", "🌟"), ("handshake", "🤝"), ("eyes", "👀"),
+        ("sweat", "😅"), ("halo", "😇"), ("wave", "👋"), ("muscle", "💪"),
+        ("rocket", "🚀"), ("brain", "🧠"), ("skull", "💀"), ("ghost", "👻"),
+    ]
+
+    def _show_emoji_picker(self, text: str) -> None:
+        """Handle /emoji command. /emoji alone shows list, /emoji <name> inserts."""
+        parts = text.split(maxsplit=1)
+        if len(parts) > 1:
+            query = parts[1].strip().lower()
+            # Try exact name match
+            for name, emoji in self.EMOJI_TABLE:
+                if name == query:
+                    self._input_buf.paste(emoji)
+                    text_now, cursor = self._input_buf.display()
+                    self.input_line.refresh_text(text_now, cursor)
+                    return
+            # Try number (1-based index)
+            try:
+                idx = int(query) - 1
+                if 0 <= idx < len(self.EMOJI_TABLE):
+                    self._input_buf.paste(self.EMOJI_TABLE[idx][1])
+                    text_now, cursor = self._input_buf.display()
+                    self.input_line.refresh_text(text_now, cursor)
+                    return
+            except ValueError:
+                pass
+            # Try partial match
+            matches = [(n, e) for n, e in self.EMOJI_TABLE if query in n]
+            if matches:
+                if len(matches) == 1:
+                    self._input_buf.paste(matches[0][1])
+                    text_now, cursor = self._input_buf.display()
+                    self.input_line.refresh_text(text_now, cursor)
+                    return
+                lines = "  ".join(f"{e} {n}" for n, e in matches)
+                self.write_system(f"[bold]Matches:[/] {lines}")
+                return
+            self.write_system(f"[red]Unknown emoji:[/] {query}. Try /emoji to see all.")
+            return
+        # Show full list
+        rows = []
+        for i in range(0, len(self.EMOJI_TABLE), 6):
+            chunk = self.EMOJI_TABLE[i:i + 6]
+            row = "  ".join(f"{e} [dim]{n}[/dim]" for n, e in chunk)
+            rows.append(row)
+        self.write_system("[bold]Emoji[/] — type /emoji <name> or /emoji <number> to insert:")
+        for row in rows:
+            self.write_system(row)
+
+    def _show_help(self) -> None:
+        """Show available commands."""
+        self.write_system("[bold]Commands:[/]")
+        self.write_system("  /clear          — Clear chat history")
+        self.write_system("  /upload <path>  — Upload a file")
+        self.write_system("  /download <name> — Download a file from chat")
+        self.write_system("  /news <channel> [range] — Fetch news")
+        self.write_system("  /scan [path]    — Scan for DNS IPs")
+        self.write_system("  /dns-remove <ip> — Remove offline DNS link")
+        self.write_system("  /emoji [name]   — Show/insert emoji")
+        self.write_system("  /help           — Show this help")
 
     @staticmethod
     def _detect_upload(text: str) -> Optional[str]:

@@ -446,10 +446,11 @@ class ChatWindow(QMainWindow):
     progress_signal = Signal(str, object, str)
     system_signal = Signal(str)
 
-    def __init__(self, config: dict, startup_lines: Optional[List[str]] = None, on_close_callback: Optional[Callable] = None):
+    def __init__(self, config: dict, startup_lines: Optional[List[str]] = None, on_close_callback: Optional[Callable] = None, state_path: Optional[Path] = None):
         super().__init__()
         self.config = config
         self.on_close_callback = on_close_callback
+        self.state_path = state_path
         self.startup_lines = startup_lines or []
         self.thread_pool = QThreadPool(self)
         self.thread_pool.setMaxThreadCount(1)
@@ -843,6 +844,7 @@ class ChatWindow(QMainWindow):
         self.config["proxy_ports"] = list(self.transport.proxy_ports)
         self._append_system_message(f"Removed offline DNS link: {ip}")
         self._render_status(self.transport.status, self.transport.last_error)
+        self._persist_dns_list()
 
     def _render_online_users(self) -> None:
         self.online_list.clear()
@@ -1528,6 +1530,7 @@ class ChatWindow(QMainWindow):
         self.transport.proxy_ports.append(new_port)
         self.transport.status[ip] = "unknown"
         self.transport.fail_counts[ip] = 0
+        self.transport.retry_counts[ip] = 0
         self.transport.last_online_at[ip] = None
         self.config["dns_ips"] = list(self.transport.dns_ips)
         self.config["proxy_ports"] = list(self.transport.proxy_ports)
@@ -1549,6 +1552,22 @@ class ChatWindow(QMainWindow):
             self.slipstream_manager.proxy_ports.append(new_port)
         self._append_system_message(f"Scanner found: {ip}")
         self._render_status(self.transport.status, self.transport.last_error)
+        self._persist_dns_list()
+
+    def _persist_dns_list(self) -> None:
+        """Save current DNS IPs and ports to launcher state for future runs."""
+        if not self.state_path:
+            return
+        try:
+            import json as _json
+            state = load_launcher_state(self.state_path)
+            if "dns" not in state:
+                state["dns"] = {}
+            state["dns"]["active_dns_ips"] = list(self.transport.dns_ips)
+            state["dns"]["active_proxy_ports"] = list(self.transport.proxy_ports)
+            self.state_path.write_text(_json.dumps(state, indent=2))
+        except Exception:
+            pass
 
     def _start_slipstream_clients(self) -> None:
         self.slipstream_manager = SlipstreamManager(
@@ -2040,6 +2059,13 @@ class LauncherWindow(QMainWindow):
             delete_secure_password(dns_key)
         save_launcher_state(self.state_path, values)
         base_port = 8000
+        # Merge previously persisted IPs (from scanner) that aren't already selected.
+        dns_ips = list(values["ips"])
+        saved = load_launcher_state(self.state_path)
+        saved_ips = saved.get("dns", {}).get("active_dns_ips", [])
+        for ip in saved_ips:
+            if ip not in dns_ips:
+                dns_ips.append(ip)
         config = {
             "mode": "dns",
             "slip_path": str(values["slip_path"]),
@@ -2048,13 +2074,13 @@ class LauncherWindow(QMainWindow):
             "password": values["password"],
             "name": values["name"],
             "remote_script": values["remote_script"],
-            "dns_ips": values["ips"],
-            "proxy_ports": [base_port + idx for idx in range(len(values["ips"]))],
+            "dns_ips": dns_ips,
+            "proxy_ports": [base_port + idx for idx in range(len(dns_ips))],
             "scanner_input_file": self.dns_scan_input.text().strip(),
         }
         startup_lines = [
             "Preparing DNSTT chat session...",
-            f"Using {len(values['ips'])} DNS link(s).",
+            f"Using {len(dns_ips)} DNS link(s).",
         ]
         self._open_chat(config, startup_lines=startup_lines)
 
@@ -2065,6 +2091,7 @@ class LauncherWindow(QMainWindow):
             config=config,
             startup_lines=startup_lines,
             on_close_callback=self.show,
+            state_path=self.state_path,
         )
         self.chat_window.show()
         self.hide()
