@@ -1258,6 +1258,7 @@ class ChatView(Static):
         self._scanner_proc: Optional[subprocess.Popen] = None
         self._scanner_output_path = APP_RUNTIME_ROOT / "scanner-result.txt"
         self._scanner_known_ips: set = set()
+        self._scanner_added_count: int = 0
         self._scan_finished_at: Optional[float] = None
         self._scan_timer = None
         self._on_new_dns_ip = on_new_dns_ip
@@ -1374,6 +1375,7 @@ class ChatView(Static):
         self._scanner_output_path.parent.mkdir(parents=True, exist_ok=True)
         self._scanner_output_path.write_text("")
         self._scanner_known_ips.clear()
+        self._scanner_added_count = 0
         self._scan_finished_at = None
         self._scanner_proc = subprocess.Popen(
             [sys.executable, str(scanner_script), "-f", str(input_path), "-o", str(self._scanner_output_path)],
@@ -1416,11 +1418,12 @@ class ChatView(Static):
                                 if ip not in self.transport.dns_ips:
                                     self._add_scanner_ip(ip)
                     self._render_status_panel(self.transport.status)
-                new_ips = len([ip for ip in self._scanner_known_ips if ip in self.transport.dns_ips])
-                skipped = len(self._scanner_known_ips) - new_ips
-                msg = f"[green]Scan complete[/]: {len(self._scanner_known_ips)} IPs found"
-                if skipped:
-                    msg += f" ({skipped} already known)"
+                total = len(self._scanner_known_ips)
+                added = self._scanner_added_count
+                already = total - added
+                msg = f"[green]Scan complete[/]: {total} IPs found"
+                if already:
+                    msg += f", {added} new, {already} already known"
                 self.write_system(msg)
             # Keep polling for 5s after finish to catch stragglers, then pause
             if time.time() - self._scan_finished_at > 5:
@@ -1436,6 +1439,7 @@ class ChatView(Static):
         self.transport.fail_counts[ip] = 0
         self.transport.retry_counts[ip] = 0
         self.transport.last_online_at[ip] = None
+        self._scanner_added_count += 1
         self.write_system(f"[green]Scanner found:[/] {ip}")
         if self._on_new_dns_ip:
             self._on_new_dns_ip(ip, new_port)
