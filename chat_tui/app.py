@@ -1220,14 +1220,9 @@ class ChatView(Static):
     #input-area {
         height: auto;
         layout: vertical;
-        padding: 1 2 0 2;
+        padding: 0 2;
         background: #1e1e2e;
         border-top: solid #3a3a5c;
-    }
-    #input-label {
-        height: 1;
-        padding: 0 0;
-        color: #6c6c8a;
     }
     #transfer-status {
         height: auto;
@@ -1491,8 +1486,7 @@ class ChatView(Static):
                 yield RichLog(id="chat-area", wrap=True, markup=True)
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
-            yield Static("[dim]Message · /help for commands[/dim]", id="input-label")
-            yield InputLine(placeholder="Type a message...", id="msg-input")
+            yield InputLine(placeholder="Type a message... · /help for commands", id="msg-input")
 
     def on_mount(self) -> None:
         self.chat_area = self.query_one("#chat-area", RichLog)
