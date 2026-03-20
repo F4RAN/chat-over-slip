@@ -1157,7 +1157,7 @@ class ChatView(Static):
     #chat-area {
         width: 1fr;
         height: 1fr;
-        padding: 1 2;
+        padding: 0 2;
         border: solid $primary;
     }
     #sidebar {
@@ -1222,7 +1222,6 @@ class ChatView(Static):
         layout: vertical;
         padding: 0 2;
         background: #1e1e2e;
-        border-top: solid #3a3a5c;
     }
     #transfer-status {
         height: auto;
