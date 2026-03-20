@@ -1,3 +1,4 @@
+.env
 .launcher_state.json
 .pyinstaller-*/
 .venv/

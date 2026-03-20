@@ -6,13 +6,20 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Iterable, Tuple
 
 from telethon.sync import TelegramClient
 
-API_ID = int(os.environ.get("TG_NEWS_API_ID", "2040"))
-API_HASH = os.environ.get("TG_NEWS_API_HASH", "b18441a1ff607e10a989891a5462e627")
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from chat_common.env_file import load_repo_env
+
+load_repo_env(_ROOT)
+
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_PATH = BASE_DIR / "session"
 NEWS_DIR = BASE_DIR / "tg_news"
@@ -63,12 +70,14 @@ def download_media(client: TelegramClient, message, channel_slug: str) -> Tuple[
     return display_name, f"tg_news/{saved.name}"
 
 
-def iter_records(channel: str, spec: str) -> Iterable[Tuple[str, str, str]]:
+def iter_records(
+    channel: str, spec: str, api_id: int, api_hash: str
+) -> Iterable[Tuple[str, str, str]]:
     limit, offset = parse_range(spec)
     channel_slug = slugify(channel)
     sender_name = f"news/{channel_slug}"
 
-    with TelegramClient(str(SESSION_PATH), API_ID, API_HASH) as client:
+    with TelegramClient(str(SESSION_PATH), api_id, api_hash) as client:
         messages = client.get_messages(channel, limit=limit, add_offset=offset)
         for message in reversed(list(messages)):
             base_id = f"news-{channel_slug}-{message.id}"
@@ -92,11 +101,25 @@ def main() -> int:
     parser.add_argument("range_spec", nargs="?", default="10", help="Count or START-END range, e.g. 10 or 20-10")
     args = parser.parse_args()
 
+    raw_id = os.environ.get("TG_NEWS_API_ID", "").strip()
+    api_hash = os.environ.get("TG_NEWS_API_HASH", "").strip()
+    if not raw_id or not api_hash:
+        print(
+            "tg_news error: set TG_NEWS_API_ID and TG_NEWS_API_HASH (see .env.example)",
+            file=sys.stderr,
+        )
+        return 1
     try:
-        for msg_id, name, text in iter_records(args.channel, args.range_spec):
+        api_id = int(raw_id)
+    except ValueError:
+        print("tg_news error: TG_NEWS_API_ID must be an integer", file=sys.stderr)
+        return 1
+
+    try:
+        for msg_id, name, text in iter_records(args.channel, args.range_spec, api_id, api_hash):
             emit_record(msg_id, name, text)
     except Exception as exc:
-        print(f"tg_news error: {exc}", file=os.sys.stderr)
+        print(f"tg_news error: {exc}", file=sys.stderr)
         return 1
     return 0
 

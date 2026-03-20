@@ -4,12 +4,28 @@
 import argparse
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import requests
 
-TOKEN = "8009331500:AAEy828Zmb1canIWjgjqAJEp3Q3DXHjyKuU"
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from chat_common.env_file import load_repo_env
+
+load_repo_env(_ROOT)
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+if not TOKEN:
+    print(
+        "TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env and configure Telegram.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 BASE_DIR = Path(__file__).resolve().parent
