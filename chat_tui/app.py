@@ -950,14 +950,14 @@ class InputLine(Static):
         self._placeholder = placeholder
         self._text = ""
         self._cursor_pos = 0
-        self.update(f"[italic #6c6c8a]{escape(self._placeholder)}[/]")
+        self.update(f"[reverse] [/reverse] [italic #6c6c8a]{escape(self._placeholder)}[/]")
 
     def refresh_text(self, text: str, cursor_pos: int) -> None:
         """Update display. Called from event loop via call_soon_threadsafe."""
         self._text = text
         self._cursor_pos = cursor_pos
         if not text:
-            self.update(f"[italic #6c6c8a]{escape(self._placeholder)}[/]")
+            self.update(f"[reverse] [/reverse] [italic #6c6c8a]{escape(self._placeholder)}[/]")
         else:
             left = escape(text[:cursor_pos])
             cursor_ch = escape(text[cursor_pos]) if cursor_pos < len(text) else " "
