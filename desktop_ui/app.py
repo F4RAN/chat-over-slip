@@ -486,6 +486,7 @@ class ChatWindow(QMainWindow):
         self._scanner_proc: Optional[subprocess.Popen] = None
         self._scanner_output_path = APP_STATE_ROOT / "chat-scanner-result.txt"
         self._scanner_known_ips: set = set()
+        self._scanner_added_count: int = 0
         self._scan_finished_at: Optional[float] = None
         self.setWindowTitle(f"Chat over DNSTT - {self.session.display_name}")
         self.resize(1150, 760)
@@ -1481,6 +1482,7 @@ class ChatWindow(QMainWindow):
         self._scanner_output_path.parent.mkdir(parents=True, exist_ok=True)
         self._scanner_output_path.write_text("")
         self._scanner_known_ips.clear()
+        self._scanner_added_count = 0
         self._scan_finished_at = None
         self._scanner_proc = subprocess.Popen(
             [sys.executable, str(scanner_script), "-f", str(input_file), "-o", str(self._scanner_output_path)],
@@ -1519,11 +1521,12 @@ class ChatWindow(QMainWindow):
                             if ip not in self.transport.dns_ips:
                                 self._add_chat_scanner_ip(ip)
                     self._render_status(self.transport.status, self.transport.last_error)
-                new_ips = len([ip for ip in self._scanner_known_ips if ip in self.transport.dns_ips])
-                skipped = len(self._scanner_known_ips) - new_ips
-                msg = f"Scan complete: {len(self._scanner_known_ips)} IPs found"
-                if skipped:
-                    msg += f" ({skipped} already known)"
+                total = len(self._scanner_known_ips)
+                added = self._scanner_added_count
+                already = total - added
+                msg = f"Scan complete: {total} IPs found"
+                if already:
+                    msg += f", {added} new, {already} already known"
                 self._append_system_message(msg)
             elapsed = max(0, int(time.time() - self._scan_finished_at))
             if elapsed < 60:
@@ -1545,6 +1548,7 @@ class ChatWindow(QMainWindow):
         self.transport.fail_counts[ip] = 0
         self.transport.retry_counts[ip] = 0
         self.transport.last_online_at[ip] = None
+        self._scanner_added_count += 1
         self.config["dns_ips"] = list(self.transport.dns_ips)
         self.config["proxy_ports"] = list(self.transport.proxy_ports)
         if self.slipstream_manager:
