@@ -1511,7 +1511,20 @@ class ChatWindow(QMainWindow):
         if self._scanner_proc:
             if self._scan_finished_at is None:
                 self._scan_finished_at = time.time()
-                self._append_system_message(f"Scan complete: {len(self._scanner_known_ips)} IPs found")
+                # Final read to catch results flushed right before exit
+                if self._scanner_output_path.exists():
+                    for ip, _stamp in parse_dns_result_file(str(self._scanner_output_path)):
+                        if ip and ip not in self._scanner_known_ips:
+                            self._scanner_known_ips.add(ip)
+                            if ip not in self.transport.dns_ips:
+                                self._add_chat_scanner_ip(ip)
+                    self._render_status(self.transport.status, self.transport.last_error)
+                new_ips = len([ip for ip in self._scanner_known_ips if ip in self.transport.dns_ips])
+                skipped = len(self._scanner_known_ips) - new_ips
+                msg = f"Scan complete: {len(self._scanner_known_ips)} IPs found"
+                if skipped:
+                    msg += f" ({skipped} already known)"
+                self._append_system_message(msg)
             elapsed = max(0, int(time.time() - self._scan_finished_at))
             if elapsed < 60:
                 age = "just now"
