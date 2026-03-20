@@ -1401,14 +1401,31 @@ class ChatView(Static):
                             new_found = True
             if new_found:
                 self._render_status_panel(self.transport.status)
-        if self._scanner_proc and self._scanner_proc.poll() is not None:
+        proc_done = self._scanner_proc and self._scanner_proc.poll() is not None
+        if proc_done:
             if self._scan_finished_at is None:
                 self._scan_finished_at = time.time()
-                self.write_system(f"[green]Scan complete[/]: {len(self._scanner_known_ips)} IPs found")
-            self._render_status_panel(self.transport.status)
-        if not self._scanner_proc or self._scanner_proc.poll() is not None:
-            if self._scan_timer and self._scan_finished_at:
-                self._scan_timer.pause()
+                # Do one final read to catch any results flushed right before exit
+                if self._scanner_output_path.exists():
+                    for line in self._scanner_output_path.read_text().splitlines():
+                        if "IP:" in line and "Time:" in line:
+                            parts = line.split("IP:")[1].strip().split("-")
+                            ip = parts[0].strip()
+                            if ip and ip not in self._scanner_known_ips:
+                                self._scanner_known_ips.add(ip)
+                                if ip not in self.transport.dns_ips:
+                                    self._add_scanner_ip(ip)
+                    self._render_status_panel(self.transport.status)
+                new_ips = len([ip for ip in self._scanner_known_ips if ip in self.transport.dns_ips])
+                skipped = len(self._scanner_known_ips) - new_ips
+                msg = f"[green]Scan complete[/]: {len(self._scanner_known_ips)} IPs found"
+                if skipped:
+                    msg += f" ({skipped} already known)"
+                self.write_system(msg)
+            # Keep polling for 5s after finish to catch stragglers, then pause
+            if time.time() - self._scan_finished_at > 5:
+                if self._scan_timer:
+                    self._scan_timer.pause()
 
     def _add_scanner_ip(self, ip: str) -> None:
         max_port = max(self.transport.proxy_ports) if self.transport.proxy_ports else 7999
