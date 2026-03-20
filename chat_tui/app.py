@@ -936,15 +936,12 @@ class InputLine(Static):
 
     DEFAULT_CSS = """
     InputLine {
-        height: 3;
+        height: auto;
+        min-height: 1;
         width: 1fr;
-        background: #1a1a2e;
+        background: #1e1e2e;
         color: $text;
-        padding: 1 2;
-        border: tall #3a3a5c;
-    }
-    InputLine:focus-within {
-        border: tall $accent;
+        padding: 0 1;
     }
     """
 
@@ -953,20 +950,19 @@ class InputLine(Static):
         self._placeholder = placeholder
         self._text = ""
         self._cursor_pos = 0
-        self.update(f"[#555580]{escape(self._placeholder)}[/]")
+        self.update(f"[italic #6c6c8a]{escape(self._placeholder)}[/]")
 
     def refresh_text(self, text: str, cursor_pos: int) -> None:
         """Update display. Called from event loop via call_soon_threadsafe."""
         self._text = text
         self._cursor_pos = cursor_pos
         if not text:
-            self.update(f"[#555580]{escape(self._placeholder)}[/]")
+            self.update(f"[italic #6c6c8a]{escape(self._placeholder)}[/]")
         else:
-            # Show text with a visible cursor position
             left = escape(text[:cursor_pos])
             cursor_ch = escape(text[cursor_pos]) if cursor_pos < len(text) else " "
             right = escape(text[cursor_pos + 1:]) if cursor_pos < len(text) else ""
-            self.update(f"{left}[reverse bold]{cursor_ch}[/reverse bold]{right}")
+            self.update(f"{left}[reverse]{cursor_ch}[/reverse]{right}")
 
 
 def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, display_widget: InputLine) -> None:
@@ -1224,18 +1220,19 @@ class ChatView(Static):
     #input-area {
         height: auto;
         layout: vertical;
-        padding: 0 1;
-        margin: 0 0;
+        padding: 1 2 0 2;
+        background: #1e1e2e;
+        border-top: solid #3a3a5c;
     }
     #input-label {
         height: 1;
-        padding: 0 1;
-        color: $text-muted;
+        padding: 0 0;
+        color: #6c6c8a;
     }
     #transfer-status {
         height: auto;
         min-height: 0;
-        padding: 0 1;
+        padding: 0 0;
     }
     """
 
