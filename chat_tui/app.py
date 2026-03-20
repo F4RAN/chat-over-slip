@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from rich import box
-from rich.console import Group
+from rich.console import Console, Group
 from rich.markup import escape
+from rich.segment import Segment
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
@@ -31,6 +32,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual import events
+from textual.geometry import Size
+from textual.strip import Strip
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 # Tunable parameters for poor or unstable networks.
@@ -1187,6 +1190,8 @@ class ChatView(Static):
         self.upload_status: Dict[str, str] = {}
         self.available_files: Dict[str, str] = {}
         self.seen_msg_ids: set = set()
+        self._last_rendered_snapshot: str = ""  # last snapshot string we rendered
+        self._last_rendered_pending: list[tuple[str, str]] = []  # pending msgs at last render
         self.scanner_input_file = scanner_input_file
         self._scanner_proc: Optional[subprocess.Popen] = None
         self._scanner_output_path = APP_RUNTIME_ROOT / "scanner-result.txt"
@@ -1454,15 +1459,22 @@ class ChatView(Static):
         if is_dns:
             live = set(self.transport.dns_ips)
             statuses = {k: v for k, v in statuses.items() if k in live}
+
+        # Quick snapshot to skip work when nothing changed
+        err = self.transport.last_error or ""
+        snap = f"{self.transport.mode}|{err}|" + "|".join(f"{k}:{v}" for k, v in statuses.items())
+        if hasattr(self, "_last_status_snap") and snap == self._last_status_snap:
+            return
+        self._last_status_snap = snap
+
         self.status_panel.render_status(
             self.transport.mode.upper(),
             statuses,
-            "" if is_dns else self.transport.last_error,
+            "" if is_dns else err,
         )
         if is_dns:
             ages = {label: self.transport.last_online_age_seconds(label) for label in statuses}
             self._update_link_buttons(statuses, ages)
-            err = self.transport.last_error
             self.error_text_w.update(f"[red]{err}[/red]" if err else "")
             scanner_text = self._scanner_status_text()
             self.scan_status_w.update(f"[dim]{scanner_text}[/dim]" if scanner_text else "")
@@ -1502,7 +1514,8 @@ class ChatView(Static):
             btn = self.query_one(f"#{btn_id}", Button)
             btn.set_classes("filter-btn filter-active" if btn_mode == mode else "filter-btn")
         if self.last_snapshot:
-            self._render_snapshot(self.last_snapshot)
+            self._last_rendered_snapshot = ""  # force re-render
+            asyncio.create_task(self._render_snapshot(self.last_snapshot))
 
     async def refresh_now(self) -> None:
         try:
@@ -1510,7 +1523,7 @@ class ChatView(Static):
             self._render_status_panel(statuses)
             if snapshot is not None:
                 self.last_snapshot = snapshot
-                self._render_snapshot(snapshot)
+                await self._render_snapshot(snapshot)
         except Exception as exc:
             self.transport.last_error = str(exc)
             self._render_status_panel(self.transport.status)
@@ -1564,7 +1577,7 @@ class ChatView(Static):
                 self._render_status_panel(statuses)
                 if snapshot is not None and snapshot != self.last_snapshot:
                     self.last_snapshot = snapshot
-                    self._render_snapshot(snapshot)
+                    await self._render_snapshot(snapshot)
                 # When SSH is back online, retry all pending messages.
                 # Fire as independent task so poll loop continues.
                 if (
@@ -1589,30 +1602,122 @@ class ChatView(Static):
             return is_news
         return not is_news  # "messages" mode
 
-    def _render_snapshot(self, snapshot: str) -> None:
-        self.chat_area.clear()
+    def _prerender_snapshot(self, snapshot: str, pending: list, render_width: int) -> tuple:
+        """Heavy rendering in a background thread — NO event loop work here.
+
+        Returns (strips, available_files, new_msg_ids, should_play).
+        """
+        import textwrap
+
+        console = Console(width=render_width, highlight=False, markup=True)
+        render_options = console.options.update_width(render_width)
+
+        all_strips: list[Strip] = []
         available_files: Dict[str, str] = {}
+        new_msg_ids: set = set()
         had_previous = len(self.seen_msg_ids) > 0
         should_play = False
+
+        def _render_one(renderable) -> list[Strip]:
+            segments = console.render(renderable, render_options)
+            lines = list(Segment.split_lines(segments))
+            if not lines:
+                return [Strip.blank(render_width)]
+            strips = Strip.from_lines(lines)
+            for s in strips:
+                s.adjust_cell_length(render_width)
+            return strips
+
         for line in snapshot.splitlines():
             if "|" in line:
                 parts = line.split("|", 3)
                 if len(parts) == 4:
                     ts, msg_id, user, text = parts
+                    new_msg_ids.add(msg_id)
                     if msg_id not in self.seen_msg_ids and had_previous and user != self.display_name:
                         should_play = True
-                    self.seen_msg_ids.add(msg_id)
                     display_text, file_entry = self._parse_file_message(text)
                     if self._should_show_message(user):
                         header = f"[dim]{ts}[/] [bold]{user}[/]"
-                        self._write_message(header, display_text)
+                        if self._has_rtl(display_text):
+                            LRM = "\u200E"
+                            max_w = max(20, render_width - 6)
+                            all_strips.extend(_render_one(Rule(style="dim")))
+                            all_strips.extend(_render_one(Text.from_markup(LRM + header)))
+                            plain = Text.from_markup(display_text).plain
+                            wrapped: list[str] = []
+                            for para in plain.split("\n"):
+                                if para.strip():
+                                    for wl in textwrap.fill(para, width=max_w).split("\n"):
+                                        wrapped.append(LRM + wl)
+                                else:
+                                    wrapped.append("")
+                            all_strips.extend(_render_one(Text("\n".join(wrapped))))
+                        else:
+                            body = Text.from_markup(display_text)
+                            panel = Panel(
+                                Group(Text.from_markup(header), body),
+                                padding=(0, 1),
+                                border_style="dim",
+                                box=box.ROUNDED,
+                            )
+                            all_strips.extend(_render_one(panel))
                     if file_entry:
                         name, relative_path = file_entry
                         available_files[name] = relative_path
                     continue
-            self.chat_area.write(line)
-        for user, text in self.pending_messages:
-            self._append_local_line(user, text, pending=True)
+            # Non-message lines
+            all_strips.extend(_render_one(Text.from_markup(line) if "[" in line else Text(line)))
+
+        # Pending messages
+        for user, text in pending:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            display_text, _ = self._parse_file_message(text)
+            header = f"[dim]{now}[/] [bold]{user}[/]"
+            body = Text.from_markup(display_text)
+            body.append(" (pending)", style="yellow")
+            panel = Panel(
+                Group(Text.from_markup(header), body),
+                padding=(0, 1),
+                border_style="dim",
+                box=box.ROUNDED,
+            )
+            all_strips.extend(_render_one(panel))
+
+        return all_strips, available_files, new_msg_ids, should_play
+
+    async def _render_snapshot(self, snapshot: str) -> None:
+        """Parse and render snapshot — heavy work in thread, fast swap on event loop."""
+        # Skip if nothing changed
+        pending_copy = list(self.pending_messages)
+        if snapshot == self._last_rendered_snapshot and pending_copy == self._last_rendered_pending:
+            return
+        self._last_rendered_snapshot = snapshot
+        self._last_rendered_pending = pending_copy
+
+        # Get render width from the chat area
+        try:
+            render_width = self.chat_area.scrollable_content_region.width
+        except Exception:
+            render_width = 80
+        render_width = max(render_width, 40)
+
+        # Heavy rendering in thread
+        strips, available_files, new_msg_ids, should_play = await asyncio.to_thread(
+            self._prerender_snapshot, snapshot, pending_copy, render_width
+        )
+
+        # Fast swap on event loop — just list operations + size update
+        self.chat_area.lines.clear()
+        self.chat_area._line_cache.clear()
+        self.chat_area._start_line = 0
+        self.chat_area.lines.extend(strips)
+        widest = max((s.cell_length for s in strips), default=render_width)
+        self.chat_area._widest_line_width = widest
+        self.chat_area.virtual_size = Size(widest, len(self.chat_area.lines))
+        self.chat_area.scroll_end(animate=False)
+
+        self.seen_msg_ids.update(new_msg_ids)
         self.available_files = available_files
         if should_play:
             self._play_notification_sound()
@@ -1668,7 +1773,7 @@ class ChatView(Static):
 
     async def _send_text(self, text: str) -> None:
         self.pending_messages.append((self.display_name, text))
-        self._render_snapshot(self.last_snapshot)
+        await self._render_snapshot(self.last_snapshot)
         asyncio.create_task(self._send_text_background(text))
 
     async def _retry_all_pending(self) -> None:
@@ -1700,9 +1805,9 @@ class ChatView(Static):
             self._render_status_panel(statuses)
             if snapshot is not None:
                 self.last_snapshot = snapshot
-                self._render_snapshot(snapshot)
+                await self._render_snapshot(snapshot)
             else:
-                self._render_snapshot(self.last_snapshot)
+                await self._render_snapshot(self.last_snapshot)
         finally:
             self._retrying_pending = False
 
@@ -1720,9 +1825,9 @@ class ChatView(Static):
         self._render_status_panel(statuses)
         if snapshot is not None:
             self.last_snapshot = snapshot
-            self._render_snapshot(snapshot)
+            await self._render_snapshot(snapshot)
         else:
-            self._render_snapshot(self.last_snapshot)
+            await self._render_snapshot(self.last_snapshot)
 
     async def _clear_chat(self) -> None:
         ok, err = await asyncio.to_thread(self.transport.clear_messages)
