@@ -720,20 +720,26 @@ class ChatTransport:
             self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
             return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
 
-        # DNS mode — try links, preferring ones that are already online
-        current_links = sorted(
-            zip(self.dns_ips, self.proxy_ports),
-            key=lambda item: {"ok": 0, "unknown": 1, "fail": 2}.get(
-                self.status.get(item[0], "unknown"), 1
-            ),
-        )
-        for ip, port in current_links:
-            link_ip, state, output, error = self._run_link_command(ip, port, remote_command, timeout)
+        # DNS mode — race all links in parallel (like read_messages)
+        current_links = list(zip(self.dns_ips, self.proxy_ports))
+        if not current_links:
+            return False, "no DNS links configured"
+        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
+        futures = [
+            executor.submit(self._run_link_command, ip, port, remote_command, timeout)
+            for ip, port in current_links
+        ]
+        errors = []
+        for future in as_completed(futures):
+            ip, state, output, error = future.result()
             if state == "ok":
-                self._mark_success(link_ip)
+                self._mark_success(ip)
+                executor.shutdown(wait=False, cancel_futures=True)
                 return True, output
-            self._mark_failure(link_ip, error)
-        return False, "no working link"
+            self._mark_failure(ip, error)
+            if error:
+                errors.append(f"{ip}: {error}")
+        return False, "; ".join(errors) if errors else "no working link"
 
     def codex_check_login(self) -> Tuple[bool, str]:
         """Check if Codex CLI is logged in. Returns (ok, output)."""
