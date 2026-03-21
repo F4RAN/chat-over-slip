@@ -165,12 +165,29 @@ This repository may include a prebuilt [`slipstream/slipstream-client`](slipstre
 
 ---
 
-## Design ideas (not implemented)
+## Transport design (implemented)
 
-These are directions discussed for **censorship / DPI** and **robustness**; they are not how the client behaves today.
+These techniques are built into the client transport layer for **censorship / DPI resistance** and **robustness**.
 
-1. **Short-lived tunnels + one SSH per operation** — Deep-packet inspection often targets **long-lived DNS streams**. A possible approach: keep each DNS tunnel session **very short**, run **one remote `chat.sh` invocation per SSH connection**, then tear down SSH and the tunnel before starting the next. That trades latency and overhead for a smaller observable fingerprint.
-2. **Fan-out across resolvers** — For robustness under lossy paths: **send the same logical operation through every configured DNS link in parallel** and **accept the first successful (or fastest) response**, discarding duplicates. Today the transport uses multiple links mainly for failover/restart rather than strict racing.
+1. **Short-lived tunnels + one SSH per operation** — Deep-packet inspection often targets **long-lived DNS streams**. The client keeps each DNS tunnel session **very short**: it runs **one remote `chat.sh` invocation per SSH connection**, then tears down SSH and the tunnel before starting the next. This trades latency and overhead for a smaller observable fingerprint that is harder to flag as a persistent tunnel.
+2. **Fan-out across resolvers** — For robustness under lossy paths the transport **sends the same logical operation through every ready DNS link in parallel** and **accepts the first successful response**, cancelling the rest. This applies to reads, sends, file operations, and Codex commands alike. Links are filtered by a `ready_ips` set (populated when a Slipstream tunnel starts successfully) so only active tunnels participate in the race.
+
+---
+
+## ChatGPT over Codex CLI
+
+The TUI includes a **ChatGPT** tab that lets you interact with OpenAI's Codex CLI running on the remote server — using the exact same SSH / DNS transport as regular chat messages.
+
+### How it works
+
+A companion script [`codex.sh`](codex.sh) lives on the server alongside `chat.sh`. It wraps the Codex CLI to provide session management, prompt submission, and response polling over the same `bash … <script>` pattern the chat uses. The client calls `codex.sh` with flags (`-l` login check, `-s` list sessions, `-p` send prompt, `-c` check status, `-x` clear session) through the transport layer.
+
+### Features
+
+- **Login check** — verify the remote Codex / OpenAI authentication is working.
+- **Session management** — list, create, switch between, and clear ChatGPT sessions stored on the server.
+- **Prompt & poll** — send a prompt to ChatGPT via Codex CLI and automatically poll for the response; results appear in the TUI chat area.
+- **Same transport, same resilience** — Codex commands use the same `ready_ips` filtering, parallel fan-out, and first-success-wins logic as `read_messages` and `send_message`, so they benefit from the same DPI resistance and link redundancy as regular chat.
 
 ---
 
