@@ -13,6 +13,7 @@ hiddenimports += ["chat_tui.app", "launcher.app"]
 
 datas = collect_data_files("textual")
 datas += collect_data_files("rich")
+datas += [(str(project_root / "scanner.py"), ".")]
 
 
 a = Analysis(

@@ -967,6 +967,348 @@ class InputLine(Static):
             self.update(f"{left}[reverse]{cursor_ch}[/reverse]{right}")
 
 
+class CodexView(Static):
+    """ChatGPT/Codex chat panel — runs Codex CLI on the remote server."""
+
+    DEFAULT_CSS = """
+    CodexView {
+        height: 1fr;
+        width: 100%;
+        layout: vertical;
+    }
+    #codex-main {
+        height: 1fr;
+        layout: horizontal;
+    }
+    #codex-chat-column {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+    }
+    #codex-sessions-bar {
+        height: 3;
+        width: 100%;
+        padding: 0 1;
+        dock: top;
+    }
+    .codex-sess-btn {
+        min-width: 10;
+        height: 3;
+        margin: 0 1 0 0;
+        background: $surface-darken-1;
+        color: $text-muted;
+        border: tall $primary-darken-2;
+    }
+    .codex-sess-btn:hover {
+        background: $primary-darken-1;
+        color: $text;
+    }
+    .codex-sess-active {
+        background: $primary;
+        color: $text;
+        border: tall $primary;
+    }
+    #codex-chat-area {
+        width: 1fr;
+        height: 1fr;
+        padding: 0 1;
+        border: solid green;
+    }
+    #codex-sidebar {
+        width: 35;
+        height: 1fr;
+        padding: 0;
+        border: solid green;
+        background: $surface-darken-1;
+    }
+    #codex-sidebar-title {
+        height: auto;
+        padding: 1;
+    }
+    #codex-session-list {
+        height: 1fr;
+        layout: vertical;
+        padding: 0;
+        overflow-y: auto;
+    }
+    .codex-session-entry {
+        height: auto;
+        width: 1fr;
+        padding: 0 1;
+    }
+    .codex-session-entry:hover {
+        background: $primary-darken-1;
+        color: white;
+    }
+    #codex-status-line {
+        height: auto;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, transport: "ChatTransport", display_name: str, **kwargs):
+        super().__init__(**kwargs)
+        self.transport = transport
+        self.display_name = display_name
+        self._codex_session_id: str = ""
+        self._codex_status: str = "IDLE"
+        self._codex_logged_in: Optional[bool] = None
+        self._codex_sessions: list[tuple[str, str]] = []
+        self._codex_conversation: list[tuple[str, str]] = []  # (role, text)
+        self._poll_timer = None
+
+    def compose(self) -> ComposeResult:
+        with Container(id="codex-main"):
+            with VerticalScroll(id="codex-sidebar"):
+                yield Static("[bold green]ChatGPT Sessions[/]", id="codex-sidebar-title")
+                yield Button("+ New Chat", id="codex-new-chat", classes="codex-sess-btn codex-sess-active")
+                yield Vertical(id="codex-session-list")
+                yield Static("", id="codex-status-line")
+            with Vertical(id="codex-chat-column"):
+                with Horizontal(id="codex-sessions-bar"):
+                    yield Button("Login Check", id="codex-login-btn", classes="codex-sess-btn")
+                    yield Button("Refresh Sessions", id="codex-refresh-btn", classes="codex-sess-btn")
+                    yield Button("Clear", id="codex-clear-btn", classes="codex-sess-btn")
+                yield RichLog(id="codex-chat-area", wrap=True, markup=True)
+
+    def on_mount(self) -> None:
+        self.codex_chat = self.query_one("#codex-chat-area", RichLog)
+        self.codex_status = self.query_one("#codex-status-line", Static)
+        self.codex_session_list = self.query_one("#codex-session-list", Vertical)
+
+        self.codex_chat.write(Panel(
+            "[bold green]ChatGPT over Codex CLI[/]\n"
+            "[dim]Powered by OpenAI Codex running on remote server[/]\n\n"
+            "[dim]• Click [bold]Login Check[/bold] to verify Codex authentication[/dim]\n"
+            "[dim]• Click [bold]Refresh Sessions[/bold] to load session history[/dim]\n"
+            "[dim]• Type your prompt below and press Enter[/dim]",
+            title="[bold]ChatGPT[/]",
+            border_style="green",
+            box=box.DOUBLE,
+        ))
+
+        # Start polling for response status
+        self._poll_timer = self.set_interval(3, self._poll_codex_status)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "codex-login-btn":
+            asyncio.create_task(self._check_login())
+        elif event.button.id == "codex-refresh-btn":
+            asyncio.create_task(self._refresh_sessions())
+        elif event.button.id == "codex-clear-btn":
+            asyncio.create_task(self._clear_current())
+        elif event.button.id == "codex-new-chat":
+            self._start_new_chat()
+        elif event.button.id and event.button.id.startswith("codex-session-"):
+            session_id = event.button.id.replace("codex-session-", "")
+            self._switch_session(session_id)
+
+    async def _check_login(self) -> None:
+        self.codex_chat.write("[yellow]Checking Codex login status...[/]")
+        ok, output = await asyncio.to_thread(self.transport.codex_check_login)
+        if not ok:
+            self.codex_chat.write(f"[red]Failed to check login:[/] {output}")
+            return
+        lines = output.strip().splitlines()
+        status = lines[0] if lines else ""
+        if status == "CODEX_LOGGED_IN":
+            self._codex_logged_in = True
+            self.codex_chat.write("[green]Codex is logged in and ready![/]")
+            self.codex_status.update("[green]● Logged in[/]")
+        elif status == "CODEX_AUTH_REQUIRED":
+            self._codex_logged_in = False
+            auth_text = "\n".join(lines[1:])
+            self.codex_chat.write(Panel(
+                f"[yellow]Authentication required![/]\n\n{auth_text}\n\n"
+                "[dim]Auth details sent to Telegram.[/]",
+                title="[bold yellow]Codex Auth[/]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            ))
+            self.codex_status.update("[yellow]● Auth required[/]")
+        else:
+            self.codex_chat.write(f"[dim]Status: {output.strip()}[/]")
+
+    async def _refresh_sessions(self) -> None:
+        self.codex_chat.write("[yellow]Loading sessions...[/]")
+        ok, output = await asyncio.to_thread(self.transport.codex_list_sessions)
+        if not ok:
+            self.codex_chat.write(f"[red]Failed to load sessions:[/] {output}")
+            return
+        self._codex_sessions.clear()
+        for child in list(self.codex_session_list.children):
+            child.remove()
+        for line in output.strip().splitlines():
+            if "|" in line:
+                parts = line.split("|", 1)
+                sid = parts[0].strip()
+                title = parts[1].strip() if len(parts) > 1 else "(untitled)"
+                if sid:
+                    self._codex_sessions.append((sid, title))
+                    short_title = title[:25] + "..." if len(title) > 28 else title
+                    btn = Button(
+                        f"{short_title}",
+                        id=f"codex-session-{sid}",
+                        classes="codex-session-entry",
+                    )
+                    self.codex_session_list.mount(btn)
+        count = len(self._codex_sessions)
+        self.codex_chat.write(f"[green]Loaded {count} session(s)[/]")
+
+    def _start_new_chat(self) -> None:
+        self._codex_session_id = ""
+        self._codex_conversation.clear()
+        self.codex_chat.clear()
+        self.codex_chat.write(Panel(
+            "[bold green]New ChatGPT Conversation[/]\n"
+            "[dim]Type your prompt below and press Enter[/]",
+            title="[bold]New Chat[/]",
+            border_style="green",
+            box=box.ROUNDED,
+        ))
+
+    def _switch_session(self, session_id: str) -> None:
+        self._codex_session_id = session_id
+        self._codex_conversation.clear()
+        self.codex_chat.clear()
+        title = ""
+        for sid, t in self._codex_sessions:
+            if sid == session_id:
+                title = t
+                break
+        self.codex_chat.write(Panel(
+            f"[bold green]Resumed Session[/]\n"
+            f"[dim]ID: {session_id}[/]\n"
+            f"[dim]Topic: {title}[/]\n\n"
+            "[dim]Type your next prompt below[/]",
+            title="[bold]Session Resumed[/]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        ))
+
+    async def _clear_current(self) -> None:
+        if self._codex_session_id:
+            ok, output = await asyncio.to_thread(
+                self.transport.codex_clear_session, self._codex_session_id
+            )
+            if ok and "CLEARED" in output:
+                self.codex_chat.write("[green]Session cleared[/]")
+                self._codex_session_id = ""
+            else:
+                self.codex_chat.write(f"[red]Clear failed:[/] {output}")
+        else:
+            ok, output = await asyncio.to_thread(self.transport.codex_clear_session)
+            self.codex_chat.clear()
+            self.codex_chat.write("[green]Chat cleared[/]")
+        self._codex_conversation.clear()
+        self._codex_status = "IDLE"
+        self.codex_status.update("[dim]● Idle[/]")
+
+    async def _send_codex_prompt(self, prompt: str) -> None:
+        # Display user message
+        now = datetime.now().strftime("%H:%M:%S")
+        self.codex_chat.write(Panel(
+            Group(
+                Text.from_markup(f"[dim]{now}[/] [bold cyan]{escape(self.display_name)}[/]"),
+                Text(prompt),
+            ),
+            padding=(0, 1),
+            border_style="cyan",
+            box=box.ROUNDED,
+        ))
+        self._codex_conversation.append(("user", prompt))
+
+        self.codex_status.update("[yellow]● Sending...[/]")
+        ok, output = await asyncio.to_thread(
+            self.transport.codex_send_prompt, prompt, self._codex_session_id
+        )
+        if not ok:
+            self.codex_chat.write(f"[red]Failed to send prompt:[/] {output}")
+            self.codex_status.update("[red]● Error[/]")
+            return
+
+        self._codex_status = "ANSWERING"
+        self.codex_status.update("[yellow]● ChatGPT is thinking...[/]")
+
+    def _poll_codex_status(self) -> None:
+        if self._codex_status != "ANSWERING":
+            return
+        asyncio.create_task(self._check_codex_response())
+
+    async def _check_codex_response(self) -> None:
+        ok, output = await asyncio.to_thread(self.transport.codex_check_status)
+        if not ok:
+            return
+
+        lines = output.strip().splitlines()
+        status = lines[0] if lines else "UNKNOWN"
+        body = "\n".join(lines[1:]) if len(lines) > 1 else ""
+
+        if status == "DONE":
+            self._codex_status = "IDLE"
+            # Extract session_id if present
+            response_text = body
+            for line in body.splitlines():
+                if line.startswith("__SESSION_ID__:"):
+                    new_sid = line.split(":", 1)[1].strip()
+                    if new_sid:
+                        self._codex_session_id = new_sid
+                    response_text = response_text.replace(line, "").strip()
+
+            now = datetime.now().strftime("%H:%M:%S")
+            self.codex_chat.write(Panel(
+                Group(
+                    Text.from_markup(f"[dim]{now}[/] [bold green]ChatGPT[/]"),
+                    Text(response_text or "(empty response)"),
+                ),
+                padding=(0, 1),
+                border_style="green",
+                box=box.DOUBLE,
+            ))
+            self._codex_conversation.append(("assistant", response_text))
+            self.codex_status.update("[green]● Ready[/]")
+        elif status == "ANSWERING":
+            self.codex_status.update("[yellow]● ChatGPT is thinking...[/]")
+        elif status == "IDLE":
+            self._codex_status = "IDLE"
+            self.codex_status.update("[dim]● Idle[/]")
+
+    async def handle_input(self, text: str) -> None:
+        """Handle a line of input routed from the main ChatView."""
+        text = text.strip()
+        if not text:
+            return
+        if text == "/help":
+            self.codex_chat.write("[bold]Codex Commands:[/]")
+            self.codex_chat.write("  /new          — Start new conversation")
+            self.codex_chat.write("  /sessions     — Refresh session list")
+            self.codex_chat.write("  /clear        — Clear current session")
+            self.codex_chat.write("  /login        — Check login status")
+            self.codex_chat.write("  /help         — Show this help")
+            return
+        if text == "/new":
+            self._start_new_chat()
+            return
+        if text == "/sessions":
+            await self._refresh_sessions()
+            return
+        if text == "/clear":
+            await self._clear_current()
+            return
+        if text == "/login":
+            await self._check_login()
+            return
+        if self._codex_status == "ANSWERING":
+            self.codex_chat.write("[yellow]Please wait — ChatGPT is still thinking...[/]")
+            return
+        await self._send_codex_prompt(text)
+
+    def shutdown(self) -> None:
+        if self._poll_timer:
+            self._poll_timer.pause()
+
+
+
 def _patch_driver_for_input(app: App, buf: InputBuffer, line_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, display_widget: InputLine) -> None:
     """Monkey-patch the app's driver so Key/Paste events are handled in the
     driver's input thread instead of the event loop.
@@ -1230,6 +1572,19 @@ class ChatView(Static):
         min-height: 0;
         padding: 0 0;
     }
+    #filter-chatgpt {
+        background: #10a37f;
+        color: white;
+        border: tall #0d8c6d;
+    }
+    #filter-chatgpt:hover {
+        background: #13bf94;
+    }
+    #codex-container {
+        height: 1fr;
+        width: 100%;
+        display: none;
+    }
     """
 
     def __init__(
@@ -1492,6 +1847,11 @@ class ChatView(Static):
         return text, None
 
     def compose(self) -> ComposeResult:
+        with Horizontal(id="filter-bar"):
+            yield Button("All", id="filter-all", classes="filter-btn filter-active")
+            yield Button("News", id="filter-news", classes="filter-btn")
+            yield Button("Messages", id="filter-messages", classes="filter-btn")
+            yield Button("ChatGPT", id="filter-chatgpt", classes="filter-btn")
         with Container(id="main"):
             with VerticalScroll(id="sidebar"):
                 yield StatusPanel(id="status")
@@ -1501,11 +1861,8 @@ class ChatView(Static):
                 yield Button("Scan", id="scan-btn")
                 yield Static("", id="scan-status")
             with Vertical(id="chat-column"):
-                with Horizontal(id="filter-bar"):
-                    yield Button("All", id="filter-all", classes="filter-btn filter-active")
-                    yield Button("News", id="filter-news", classes="filter-btn")
-                    yield Button("Messages", id="filter-messages", classes="filter-btn")
                 yield RichLog(id="chat-area", wrap=True, markup=True)
+        yield CodexView(self.transport, self.display_name, id="codex-container")
         with Container(id="input-area"):
             yield Static("", id="transfer-status")
             yield InputLine(placeholder="Type a message... · /help for commands", id="msg-input")
@@ -1533,6 +1890,10 @@ class ChatView(Static):
         asyncio.create_task(self.refresh_now())
         self.poll_task = asyncio.create_task(self._poll_loop())
         self._scan_timer = self.set_interval(2, self._poll_scanner, pause=True)
+
+        # Codex view
+        self._codex_view = self.query_one("#codex-container", CodexView)
+        self._codex_active = False
 
         # -- Standalone keyboard: patch driver to intercept keys in its thread --
         self._input_buf = InputBuffer()
@@ -1592,7 +1953,10 @@ class ChatView(Static):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "scan-btn":
             self._start_scan()
+        elif event.button.id == "filter-chatgpt":
+            self._toggle_codex_view()
         elif event.button.id in ("filter-all", "filter-news", "filter-messages"):
+            self._switch_to_chat_view()
             self._set_message_filter(event.button.id.replace("filter-", ""))
 
     def _set_message_filter(self, mode: str) -> None:
@@ -1600,9 +1964,42 @@ class ChatView(Static):
         for btn_id, btn_mode in (("filter-all", "all"), ("filter-news", "news"), ("filter-messages", "messages")):
             btn = self.query_one(f"#{btn_id}", Button)
             btn.set_classes("filter-btn filter-active" if btn_mode == mode else "filter-btn")
+        chatgpt_btn = self.query_one("#filter-chatgpt", Button)
+        chatgpt_btn.set_classes("filter-btn")
         if self.last_snapshot:
             self._last_rendered_snapshot = ""  # force re-render
             asyncio.create_task(self._render_snapshot(self.last_snapshot))
+
+    def _toggle_codex_view(self) -> None:
+        """Switch to the ChatGPT/Codex view."""
+        self._codex_active = True
+        # Hide chat, show codex
+        main_container = self.query_one("#main", Container)
+        main_container.display = False
+        self._codex_view.display = True
+        self._codex_view.styles.display = "block"
+        # Update filter button styles
+        for btn_id in ("filter-all", "filter-news", "filter-messages"):
+            self.query_one(f"#{btn_id}", Button).set_classes("filter-btn")
+        self.query_one("#filter-chatgpt", Button).set_classes("filter-btn filter-active")
+        # Update input placeholder
+        self.input_line._placeholder = "Ask ChatGPT... · /help for commands"
+        text_now, cursor = self._input_buf.display()
+        self.input_line.refresh_text(text_now, cursor)
+
+    def _switch_to_chat_view(self) -> None:
+        """Switch back from ChatGPT to the regular chat view."""
+        if not self._codex_active:
+            return
+        self._codex_active = False
+        main_container = self.query_one("#main", Container)
+        main_container.display = True
+        self._codex_view.display = False
+        self._codex_view.styles.display = "none"
+        # Restore input placeholder
+        self.input_line._placeholder = "Type a message... · /help for commands"
+        text_now, cursor = self._input_buf.display()
+        self.input_line.refresh_text(text_now, cursor)
 
     async def refresh_now(self) -> None:
         try:
@@ -1991,6 +2388,10 @@ class ChatView(Static):
             text = text.strip()
             if not text:
                 continue
+            # Route to CodexView when it's active
+            if self._codex_active and hasattr(self, "_codex_view"):
+                await self._codex_view.handle_input(text)
+                continue
             # File-path detection (runs on event loop only once, on Enter)
             if not text.startswith("/upload "):
                 upload = self._detect_upload(text)
@@ -2110,6 +2511,8 @@ class ChatView(Static):
         self.write_system("  /dns-remove <ip> — Remove offline DNS link")
         self.write_system("  /emoji [name]   — Show/insert emoji")
         self.write_system("  /help           — Show this help")
+        self.write_system("")
+        self.write_system("[bold]ChatGPT:[/] Click the [green]ChatGPT[/] tab to use AI chat")
 
     @staticmethod
     def _detect_upload(text: str) -> Optional[str]:
@@ -2154,6 +2557,8 @@ class ChatView(Static):
             self._scan_timer.pause()
         if self._scanner_proc and self._scanner_proc.poll() is None:
             self._scanner_proc.terminate()
+        if hasattr(self, "_codex_view") and self._codex_view:
+            self._codex_view.shutdown()
 
 
 class ChatApp(App):

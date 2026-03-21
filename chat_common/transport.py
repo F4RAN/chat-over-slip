@@ -699,3 +699,60 @@ class ChatTransport:
         self.last_error = "; ".join(errors) or "download failed"
         return False, self.last_error, dict(self.status)
 
+    # ---- Codex / ChatGPT methods ----
+
+    def _codex_script(self) -> str:
+        """Return the remote path to codex.sh next to the chat script."""
+        base = self.remote_script.rsplit("/", 1)[0] if "/" in self.remote_script else "."
+        return f"{base}/codex.sh"
+
+    def _codex_run(self, args: str, timeout: int = REMOTE_COMMAND_TIMEOUT) -> Tuple[bool, str]:
+        """Run a codex.sh command on the remote server."""
+        remote_command = f"bash {self._codex_script()} {args}"
+        if self.mode == "ssh":
+            try:
+                proc = self._remote_run(remote_command, timeout=timeout)
+            except Exception as exc:
+                return False, str(exc)
+            if proc.returncode == 0:
+                self._mark_success("ssh")
+                return True, proc.stdout
+            self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
+            return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
+
+        # DNS mode — try links
+        current_links = list(zip(self.dns_ips, self.proxy_ports))
+        for ip, port in current_links:
+            link_ip, state, output, error = self._run_link_command(ip, port, remote_command, timeout)
+            if state == "ok":
+                self._mark_success(link_ip)
+                return True, output
+            self._mark_failure(link_ip, error)
+        return False, "no working link"
+
+    def codex_check_login(self) -> Tuple[bool, str]:
+        """Check if Codex CLI is logged in. Returns (ok, output)."""
+        return self._codex_run("-l", timeout=20)
+
+    def codex_list_sessions(self) -> Tuple[bool, str]:
+        """List recent Codex sessions. Returns (ok, output)."""
+        return self._codex_run("-s")
+
+    def codex_send_prompt(self, prompt: str, session_id: str = "") -> Tuple[bool, str]:
+        """Send a prompt to Codex. Returns (ok, output)."""
+        args = f"-p {shlex.quote(prompt)}"
+        if session_id:
+            args += f" {shlex.quote(session_id)}"
+        return self._codex_run(args)
+
+    def codex_check_status(self) -> Tuple[bool, str]:
+        """Check status of current Codex prompt. Returns (ok, output)."""
+        return self._codex_run("-c")
+
+    def codex_clear_session(self, session_id: str = "") -> Tuple[bool, str]:
+        """Clear a Codex session. Returns (ok, output)."""
+        args = "-x"
+        if session_id:
+            args += f" {shlex.quote(session_id)}"
+        return self._codex_run(args)
+
