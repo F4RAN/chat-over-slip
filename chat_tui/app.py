@@ -694,6 +694,67 @@ class ChatTransport:
         self.last_error = "; ".join(errors) or "download failed"
         return False, self.last_error, dict(self.status)
 
+    # ---- Codex / ChatGPT methods ----
+
+    def _codex_script(self) -> str:
+        base = self.remote_script.rsplit("/", 1)[0] if "/" in self.remote_script else "."
+        return f"{base}/codex.sh"
+
+    def _codex_run(self, args: str, timeout: int = REMOTE_COMMAND_TIMEOUT) -> Tuple[bool, str]:
+        remote_command = f"bash {self._codex_script()} {args}"
+        if self.mode == "ssh":
+            try:
+                proc = self._remote_run(remote_command, timeout=timeout)
+            except Exception as exc:
+                return False, str(exc)
+            if proc.returncode == 0:
+                self._mark_success("ssh")
+                return True, proc.stdout
+            self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
+            return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
+
+        # DNS mode — race ready links in parallel (same as read_messages)
+        active = [
+            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
+            if ip in self.ready_ips
+        ]
+        if not active:
+            return False, "no ready links"
+        executor = ThreadPoolExecutor(max_workers=max(1, len(active)))
+        futures = [
+            executor.submit(self._run_link_command, ip, port, remote_command, timeout)
+            for ip, port in active
+        ]
+        for future in as_completed(futures):
+            ip, state, output, error = future.result()
+            if state == "ok":
+                self._mark_success(ip)
+                executor.shutdown(wait=False, cancel_futures=True)
+                return True, output
+            self._mark_failure(ip, error)
+        return False, "no working link"
+
+    def codex_check_login(self) -> Tuple[bool, str]:
+        return self._codex_run("-l", timeout=20)
+
+    def codex_list_sessions(self) -> Tuple[bool, str]:
+        return self._codex_run("-s")
+
+    def codex_send_prompt(self, prompt: str, session_id: str = "") -> Tuple[bool, str]:
+        args = f"-p {shlex.quote(prompt)}"
+        if session_id:
+            args += f" {shlex.quote(session_id)}"
+        return self._codex_run(args)
+
+    def codex_check_status(self) -> Tuple[bool, str]:
+        return self._codex_run("-c")
+
+    def codex_clear_session(self, session_id: str = "") -> Tuple[bool, str]:
+        args = "-x"
+        if session_id:
+            args += f" {shlex.quote(session_id)}"
+        return self._codex_run(args)
+
 
 class StatusPanel(Static):
     @staticmethod
