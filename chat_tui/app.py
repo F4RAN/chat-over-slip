@@ -1044,6 +1044,16 @@ class CodexView(Static):
         height: auto;
         padding: 0 1;
     }
+    #codex-conn-status {
+        height: auto;
+        padding: 1;
+        margin: 1 0 0 0;
+        border-top: solid $primary-darken-2;
+    }
+    #codex-dns-links {
+        height: auto;
+        padding: 0 1;
+    }
     """
 
     def __init__(self, transport: "ChatTransport", display_name: str, **kwargs):
@@ -1064,6 +1074,8 @@ class CodexView(Static):
                 yield Button("+ New Chat", id="codex-new-chat", classes="codex-sess-btn codex-sess-active")
                 yield Vertical(id="codex-session-list")
                 yield Static("", id="codex-status-line")
+                yield Static("", id="codex-conn-status")
+                yield Vertical(id="codex-dns-links")
             with Vertical(id="codex-chat-column"):
                 with Horizontal(id="codex-sessions-bar"):
                     yield Button("Login Check", id="codex-login-btn", classes="codex-sess-btn")
@@ -1075,6 +1087,9 @@ class CodexView(Static):
         self.codex_chat = self.query_one("#codex-chat-area", RichLog)
         self.codex_status = self.query_one("#codex-status-line", Static)
         self.codex_session_list = self.query_one("#codex-session-list", Vertical)
+        self._conn_status_w = self.query_one("#codex-conn-status", Static)
+        self._dns_links_w = self.query_one("#codex-dns-links", Vertical)
+        self._last_conn_snap: str = ""
 
         self.codex_chat.write(Panel(
             "[bold green]ChatGPT over Codex CLI[/]\n"
@@ -1087,8 +1102,10 @@ class CodexView(Static):
             box=box.DOUBLE,
         ))
 
-        # Start polling for response status
+        # Start polling for response status and connection status
         self._poll_timer = self.set_interval(3, self._poll_codex_status)
+        self._render_conn_status()
+        self._conn_timer = self.set_interval(3, self._render_conn_status)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "codex-login-btn":
@@ -1303,9 +1320,67 @@ class CodexView(Static):
             return
         await self._send_codex_prompt(text)
 
+    def _render_conn_status(self) -> None:
+        """Update connection status display in the sidebar."""
+        t = self.transport
+        statuses = dict(t.status)
+        is_dns = t.mode == "dns"
+        if is_dns:
+            live = set(t.dns_ips)
+            statuses = {k: v for k, v in statuses.items() if k in live}
+
+        # Build snapshot to skip no-op updates
+        snap = f"{t.mode}|" + "|".join(
+            f"{k}:{v}:{t.last_online_age_seconds(k)}" for k, v in statuses.items()
+        )
+        if snap == self._last_conn_snap:
+            return
+        self._last_conn_snap = snap
+
+        # Overall state
+        overall, color = StatusPanel._overall_state(statuses)
+        mode_label = t.mode.upper()
+        lines = [
+            f"[bold]Connection[/]",
+            f"[bold]Mode[/]: {mode_label}",
+            f"[bold]State[/]: [{color}]{overall}[/{color}]",
+        ]
+
+        if is_dns:
+            online_ips = [
+                ip for ip, st in statuses.items() if st == "ok"
+            ]
+            if online_ips:
+                lines.append(f"[bold]Online[/]: [green]{len(online_ips)}[/green]/{len(statuses)}")
+            else:
+                lines.append(f"[bold]Online[/]: 0/{len(statuses)}")
+
+        self._conn_status_w.update("\n".join(lines))
+
+        # DNS link details
+        if is_dns:
+            for child in list(self._dns_links_w.children):
+                child.remove()
+            for ip, state in statuses.items():
+                age = t.last_online_age_seconds(ip)
+                age_text = StatusPanel._format_age(age)
+                if state == "ok":
+                    text = f"[green]{ip}: {age_text}[/green]"
+                elif state == "fail":
+                    text = f"[red]{ip}: {age_text}[/red]"
+                else:
+                    text = f"[yellow]{ip}: {age_text}[/yellow]"
+                self._dns_links_w.mount(Static(text))
+        else:
+            # SSH mode - just clear dns links
+            for child in list(self._dns_links_w.children):
+                child.remove()
+
     def shutdown(self) -> None:
         if self._poll_timer:
             self._poll_timer.pause()
+        if hasattr(self, "_conn_timer") and self._conn_timer:
+            self._conn_timer.pause()
 
 
 

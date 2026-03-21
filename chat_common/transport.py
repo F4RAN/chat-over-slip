@@ -720,8 +720,13 @@ class ChatTransport:
             self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
             return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
 
-        # DNS mode — try links
-        current_links = list(zip(self.dns_ips, self.proxy_ports))
+        # DNS mode — try links, preferring ones that are already online
+        current_links = sorted(
+            zip(self.dns_ips, self.proxy_ports),
+            key=lambda item: {"ok": 0, "unknown": 1, "fail": 2}.get(
+                self.status.get(item[0], "unknown"), 1
+            ),
+        )
         for ip, port in current_links:
             link_ip, state, output, error = self._run_link_command(ip, port, remote_command, timeout)
             if state == "ok":
