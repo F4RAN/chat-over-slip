@@ -187,7 +187,7 @@ A companion script [`codex.sh`](codex.sh) lives on the server alongside `chat.sh
 - **Login check** — verify the remote Codex / OpenAI authentication is working.
 - **Session management** — list, create, switch between, and clear ChatGPT sessions stored on the server.
 - **Prompt & poll** — send a prompt to ChatGPT via Codex CLI and automatically poll for the response; results appear in the TUI chat area.
-- **Same transport, same resilience** — Codex commands use the same `ready_ips` filtering, parallel fan-out, and first-success-wins logic as `read_messages` and `send_message`, so they benefit from the same DPI resistance and link redundancy as regular chat.
+- **Same transport, same resilience** — Codex commands use the same parallel fan-out across all configured DNS links and first-success-wins logic as regular chat messaging, so they benefit from the same DPI resistance and link redundancy.
 
 ---
 

@@ -713,18 +713,16 @@ class ChatTransport:
             self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
             return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
 
-        # DNS mode — race ready links in parallel (same as read_messages)
-        active = [
-            (ip, port) for ip, port in zip(self.dns_ips, self.proxy_ports)
-            if ip in self.ready_ips
-        ]
-        if not active:
-            return False, "no ready links"
-        executor = ThreadPoolExecutor(max_workers=max(1, len(active)))
+        # DNS mode — race all links in parallel (same as chat messaging)
+        current_links = list(zip(self.dns_ips, self.proxy_ports))
+        if not current_links:
+            return False, "no DNS links configured"
+        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
         futures = [
             executor.submit(self._run_link_command, ip, port, remote_command, timeout)
-            for ip, port in active
+            for ip, port in current_links
         ]
+        errors = []
         for future in as_completed(futures):
             ip, state, output, error = future.result()
             if state == "ok":
@@ -732,7 +730,9 @@ class ChatTransport:
                 executor.shutdown(wait=False, cancel_futures=True)
                 return True, output
             self._mark_failure(ip, error)
-        return False, "no working link"
+            if error:
+                errors.append(f"{ip}: {error}")
+        return False, "; ".join(errors) if errors else "no working link"
 
     def codex_check_login(self) -> Tuple[bool, str]:
         return self._codex_run("-l", timeout=20)
