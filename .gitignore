@@ -8,3 +8,4 @@ dist/
 downloads/
 build/chat_over_dnstt/
 build/chat_over_dnstt_tui/
+.env
