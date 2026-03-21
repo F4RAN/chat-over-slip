@@ -62,6 +62,19 @@ cmd_add() {
         return 1
     fi
 
+    # Route __codex__ messages to codex.sh and store the response
+    if [ "$name" = "__codex__" ]; then
+        local codex_script="$BASE_DIR/codex.sh"
+        local codex_output
+        codex_output="$(bash "$codex_script" $safe_msg 2>&1 || true)"
+        local codex_safe
+        codex_safe="$(sanitize_message "$codex_output")"
+        ts="$(date '+%Y-%m-%d %H:%M:%S')"
+        printf '%s|%s|%s|%s\n' "$ts" "$msg_id" "__codex_resp__" "$codex_safe" >> "$FILE"
+        printf '%s\n' "$msg_id" >> "$IDS_FILE"
+        return 0
+    fi
+
     if ! awk -v id="$msg_id" '$0 == id {found=1} END {exit found ? 0 : 1}' "$IDS_FILE"; then
         ts="$(date '+%Y-%m-%d %H:%M:%S')"
         printf '%s|%s|%s|%s\n' "$ts" "$msg_id" "$name" "$safe_msg" >> "$FILE"

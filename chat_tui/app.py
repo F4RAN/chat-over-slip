@@ -403,8 +403,9 @@ class ChatTransport:
                 self.last_error = f"{ip}: {error}"
         return first_output, dict(self.status)
 
-    def send_message(self, name: str, text: str) -> Tuple[bool, str, Dict[str, str]]:
-        msg_id = uuid.uuid4().hex
+    def send_message(self, name: str, text: str, msg_id: str = "") -> Tuple[bool, str, Dict[str, str]]:
+        if not msg_id:
+            msg_id = uuid.uuid4().hex
         remote_command = (
             f"bash {self.remote_script} -n "
             f"{shlex.quote(name)} {shlex.quote(msg_id)} {shlex.quote(text)}"
@@ -695,65 +696,20 @@ class ChatTransport:
         return False, self.last_error, dict(self.status)
 
     # ---- Codex / ChatGPT methods ----
+    # All codex commands go through send_message with __codex__ user name.
+    # Responses come back through read_messages as __codex_resp__ messages.
 
-    def _codex_script(self) -> str:
-        base = self.remote_script.rsplit("/", 1)[0] if "/" in self.remote_script else "."
-        return f"{base}/codex.sh"
+    def codex_send_command(self, args: str) -> Tuple[bool, str, str]:
+        """Send a codex command via the same transport as chat messages.
 
-    def _codex_run(self, args: str, timeout: int = REMOTE_COMMAND_TIMEOUT) -> Tuple[bool, str]:
-        remote_command = f"bash {self._codex_script()} {args}"
-        if self.mode == "ssh":
-            try:
-                proc = self._remote_run(remote_command, timeout=timeout)
-            except Exception as exc:
-                return False, str(exc)
-            if proc.returncode == 0:
-                self._mark_success("ssh")
-                return True, proc.stdout
-            self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
-            return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
+        The server-side chat.sh routes __codex__ messages to codex.sh
+        and stores the result as a __codex_resp__ message with the same msg_id.
 
-        # DNS mode — race all links in parallel (same as chat messaging)
-        current_links = list(zip(self.dns_ips, self.proxy_ports))
-        if not current_links:
-            return False, "no DNS links configured"
-        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
-        futures = [
-            executor.submit(self._run_link_command, ip, port, remote_command, timeout)
-            for ip, port in current_links
-        ]
-        errors = []
-        for future in as_completed(futures):
-            ip, state, output, error = future.result()
-            if state == "ok":
-                self._mark_success(ip)
-                executor.shutdown(wait=False, cancel_futures=True)
-                return True, output
-            self._mark_failure(ip, error)
-            if error:
-                errors.append(f"{ip}: {error}")
-        return False, "; ".join(errors) if errors else "no working link"
-
-    def codex_check_login(self) -> Tuple[bool, str]:
-        return self._codex_run("-l", timeout=20)
-
-    def codex_list_sessions(self) -> Tuple[bool, str]:
-        return self._codex_run("-s")
-
-    def codex_send_prompt(self, prompt: str, session_id: str = "") -> Tuple[bool, str]:
-        args = f"-p {shlex.quote(prompt)}"
-        if session_id:
-            args += f" {shlex.quote(session_id)}"
-        return self._codex_run(args)
-
-    def codex_check_status(self) -> Tuple[bool, str]:
-        return self._codex_run("-c")
-
-    def codex_clear_session(self, session_id: str = "") -> Tuple[bool, str]:
-        args = "-x"
-        if session_id:
-            args += f" {shlex.quote(session_id)}"
-        return self._codex_run(args)
+        Returns (ok, error, msg_id).
+        """
+        msg_id = uuid.uuid4().hex
+        ok, error, _statuses = self.send_message("__codex__", args, msg_id=msg_id)
+        return ok, error, msg_id
 
 
 class StatusPanel(Static):
@@ -1127,6 +1083,9 @@ class CodexView(Static):
         self._codex_sessions: list[tuple[str, str]] = []
         self._codex_conversation: list[tuple[str, str]] = []  # (role, text)
         self._poll_timer = None
+        # Track pending codex commands by msg_id
+        self._pending_codex: dict[str, str] = {}  # msg_id -> command_type
+        self._seen_codex_ids: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with Container(id="codex-main"):
@@ -1183,55 +1142,19 @@ class CodexView(Static):
 
     async def _check_login(self) -> None:
         self.codex_chat.write("[yellow]Checking Codex login status...[/]")
-        ok, output = await asyncio.to_thread(self.transport.codex_check_login)
+        ok, error, msg_id = await asyncio.to_thread(self.transport.codex_send_command, "-l")
         if not ok:
-            self.codex_chat.write(f"[red]Failed to check login:[/] {output}")
+            self.codex_chat.write(f"[red]Failed to check login:[/] {error}")
             return
-        lines = output.strip().splitlines()
-        status = lines[0] if lines else ""
-        if status == "CODEX_LOGGED_IN":
-            self._codex_logged_in = True
-            self.codex_chat.write("[green]Codex is logged in and ready![/]")
-            self.codex_status.update("[green]● Logged in[/]")
-        elif status == "CODEX_AUTH_REQUIRED":
-            self._codex_logged_in = False
-            auth_text = "\n".join(lines[1:])
-            self.codex_chat.write(Panel(
-                f"[yellow]Authentication required![/]\n\n{auth_text}\n\n"
-                "[dim]Auth details sent to Telegram.[/]",
-                title="[bold yellow]Codex Auth[/]",
-                border_style="yellow",
-                box=box.ROUNDED,
-            ))
-            self.codex_status.update("[yellow]● Auth required[/]")
-        else:
-            self.codex_chat.write(f"[dim]Status: {output.strip()}[/]")
+        self._pending_codex[msg_id] = "login"
 
     async def _refresh_sessions(self) -> None:
         self.codex_chat.write("[yellow]Loading sessions...[/]")
-        ok, output = await asyncio.to_thread(self.transport.codex_list_sessions)
+        ok, error, msg_id = await asyncio.to_thread(self.transport.codex_send_command, "-s")
         if not ok:
-            self.codex_chat.write(f"[red]Failed to load sessions:[/] {output}")
+            self.codex_chat.write(f"[red]Failed to load sessions:[/] {error}")
             return
-        self._codex_sessions.clear()
-        for child in list(self.codex_session_list.children):
-            child.remove()
-        for line in output.strip().splitlines():
-            if "|" in line:
-                parts = line.split("|", 1)
-                sid = parts[0].strip()
-                title = parts[1].strip() if len(parts) > 1 else "(untitled)"
-                if sid:
-                    self._codex_sessions.append((sid, title))
-                    short_title = title[:25] + "..." if len(title) > 28 else title
-                    btn = Button(
-                        f"{short_title}",
-                        id=f"codex-session-{sid}",
-                        classes="codex-session-entry",
-                    )
-                    self.codex_session_list.mount(btn)
-        count = len(self._codex_sessions)
-        self.codex_chat.write(f"[green]Loaded {count} session(s)[/]")
+        self._pending_codex[msg_id] = "sessions"
 
     def _start_new_chat(self) -> None:
         self._codex_session_id = ""
@@ -1265,21 +1188,19 @@ class CodexView(Static):
         ))
 
     async def _clear_current(self) -> None:
+        args = "-x"
         if self._codex_session_id:
-            ok, output = await asyncio.to_thread(
-                self.transport.codex_clear_session, self._codex_session_id
-            )
-            if ok and "CLEARED" in output:
-                self.codex_chat.write("[green]Session cleared[/]")
-                self._codex_session_id = ""
-            else:
-                self.codex_chat.write(f"[red]Clear failed:[/] {output}")
-        else:
-            ok, output = await asyncio.to_thread(self.transport.codex_clear_session)
-            self.codex_chat.clear()
-            self.codex_chat.write("[green]Chat cleared[/]")
+            args += f" {shlex.quote(self._codex_session_id)}"
+        ok, error, msg_id = await asyncio.to_thread(self.transport.codex_send_command, args)
+        if not ok:
+            self.codex_chat.write(f"[red]Clear failed:[/] {error}")
+            return
+        self._pending_codex[msg_id] = "clear"
+        self.codex_chat.clear()
+        self.codex_chat.write("[green]Chat cleared[/]")
         self._codex_conversation.clear()
         self._codex_status = "IDLE"
+        self._codex_session_id = ""
         self.codex_status.update("[dim]● Idle[/]")
 
     async def _send_codex_prompt(self, prompt: str) -> None:
@@ -1297,34 +1218,121 @@ class CodexView(Static):
         self._codex_conversation.append(("user", prompt))
 
         self.codex_status.update("[yellow]● Sending...[/]")
-        ok, output = await asyncio.to_thread(
-            self.transport.codex_send_prompt, prompt, self._codex_session_id
-        )
+        args = f"-p {shlex.quote(prompt)}"
+        if self._codex_session_id:
+            args += f" {shlex.quote(self._codex_session_id)}"
+        ok, error, msg_id = await asyncio.to_thread(self.transport.codex_send_command, args)
         if not ok:
-            self.codex_chat.write(f"[red]Failed to send prompt:[/] {output}")
+            self.codex_chat.write(f"[red]Failed to send prompt:[/] {error}")
             self.codex_status.update("[red]● Error[/]")
             return
 
+        self._pending_codex[msg_id] = "prompt"
         self._codex_status = "ANSWERING"
         self.codex_status.update("[yellow]● ChatGPT is thinking...[/]")
 
     def _poll_codex_status(self) -> None:
+        """Poll for prompt completion when ANSWERING — sends -c via same transport."""
         if self._codex_status != "ANSWERING":
             return
-        asyncio.create_task(self._check_codex_response())
+        asyncio.create_task(self._poll_prompt_status())
 
-    async def _check_codex_response(self) -> None:
-        ok, output = await asyncio.to_thread(self.transport.codex_check_status)
-        if not ok:
-            return
+    async def _poll_prompt_status(self) -> None:
+        """Send a status check command via the shared transport."""
+        ok, error, msg_id = await asyncio.to_thread(self.transport.codex_send_command, "-c")
+        if ok:
+            self._pending_codex[msg_id] = "status"
 
-        lines = output.strip().splitlines()
+    def process_snapshot(self, snapshot: str) -> None:
+        """Extract __codex_resp__ messages from the chat snapshot.
+
+        Called by ChatView's poll loop so codex responses come through
+        the same read_messages transport as chat.
+        """
+        for line in snapshot.splitlines():
+            if "|" not in line:
+                continue
+            parts = line.split("|", 3)
+            if len(parts) != 4:
+                continue
+            ts, msg_id, user, text = parts
+            if user != "__codex_resp__":
+                continue
+            if msg_id in self._seen_codex_ids:
+                continue
+            self._seen_codex_ids.add(msg_id)
+
+            cmd_type = self._pending_codex.pop(msg_id, "unknown")
+            self._handle_codex_response(cmd_type, text, ts)
+
+    def _handle_codex_response(self, cmd_type: str, text: str, ts: str) -> None:
+        """Process a codex response based on the command type."""
+        if cmd_type == "login":
+            self._handle_login_response(text)
+        elif cmd_type == "sessions":
+            self._handle_sessions_response(text)
+        elif cmd_type == "status":
+            self._handle_status_response(text)
+        elif cmd_type == "prompt":
+            # -p returns PROMPT_SUBMITTED immediately; actual answer comes via -c polling
+            if "PROMPT_SUBMITTED" in text:
+                self._codex_status = "ANSWERING"
+                self.codex_status.update("[yellow]● ChatGPT is thinking...[/]")
+        elif cmd_type == "clear":
+            pass  # Already handled in _clear_current
+        else:
+            # Unknown response, just display it
+            self.codex_chat.write(f"[dim]{text}[/]")
+
+    def _handle_login_response(self, text: str) -> None:
+        lines = text.strip().splitlines()
+        status = lines[0] if lines else ""
+        if status == "CODEX_LOGGED_IN":
+            self._codex_logged_in = True
+            self.codex_chat.write("[green]Codex is logged in and ready![/]")
+            self.codex_status.update("[green]● Logged in[/]")
+        elif status == "CODEX_AUTH_REQUIRED":
+            self._codex_logged_in = False
+            auth_text = "\n".join(lines[1:])
+            self.codex_chat.write(Panel(
+                f"[yellow]Authentication required![/]\n\n{auth_text}\n\n"
+                "[dim]Auth details sent to Telegram.[/]",
+                title="[bold yellow]Codex Auth[/]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            ))
+            self.codex_status.update("[yellow]● Auth required[/]")
+        else:
+            self.codex_chat.write(f"[dim]Status: {text.strip()}[/]")
+
+    def _handle_sessions_response(self, text: str) -> None:
+        self._codex_sessions.clear()
+        for child in list(self.codex_session_list.children):
+            child.remove()
+        for line in text.strip().splitlines():
+            if "|" in line:
+                parts = line.split("|", 1)
+                sid = parts[0].strip()
+                title = parts[1].strip() if len(parts) > 1 else "(untitled)"
+                if sid:
+                    self._codex_sessions.append((sid, title))
+                    short_title = title[:25] + "..." if len(title) > 28 else title
+                    btn = Button(
+                        f"{short_title}",
+                        id=f"codex-session-{sid}",
+                        classes="codex-session-entry",
+                    )
+                    self.codex_session_list.mount(btn)
+        count = len(self._codex_sessions)
+        self.codex_chat.write(f"[green]Loaded {count} session(s)[/]")
+
+    def _handle_status_response(self, text: str) -> None:
+        lines = text.strip().splitlines()
         status = lines[0] if lines else "UNKNOWN"
         body = "\n".join(lines[1:]) if len(lines) > 1 else ""
 
         if status == "DONE":
             self._codex_status = "IDLE"
-            # Extract session_id if present
             response_text = body
             for line in body.splitlines():
                 if line.startswith("__SESSION_ID__:"):
@@ -2143,6 +2151,8 @@ class ChatView(Static):
             self._render_status_panel(statuses)
             if snapshot is not None:
                 self.last_snapshot = snapshot
+                if hasattr(self, "_codex_view") and self._codex_view:
+                    self._codex_view.process_snapshot(snapshot)
                 await self._render_snapshot(snapshot)
         except Exception as exc:
             self.transport.last_error = str(exc)
@@ -2197,6 +2207,9 @@ class ChatView(Static):
                 self._render_status_panel(statuses)
                 if snapshot is not None and snapshot != self.last_snapshot:
                     self.last_snapshot = snapshot
+                    # Route codex responses to CodexView
+                    if hasattr(self, "_codex_view") and self._codex_view:
+                        self._codex_view.process_snapshot(snapshot)
                     await self._render_snapshot(snapshot)
                 # When SSH is back online, retry all pending messages.
                 # Fire as independent task so poll loop continues.
@@ -2215,6 +2228,9 @@ class ChatView(Static):
             await asyncio.sleep(STATUS_POLL_INTERVAL)
 
     def _should_show_message(self, user: str) -> bool:
+        # Never show codex internal messages in the chat area
+        if user in ("__codex__", "__codex_resp__"):
+            return False
         if self._message_filter_mode == "all":
             return True
         is_news = user.startswith("news/")

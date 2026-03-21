@@ -393,8 +393,9 @@ class ChatTransport:
         live = set(self.dns_ips)
         return first_output, {k: v for k, v in self.status.items() if k in live}
 
-    def send_message(self, name: str, text: str) -> Tuple[bool, str, Dict[str, str]]:
-        msg_id = uuid.uuid4().hex
+    def send_message(self, name: str, text: str, msg_id: str = "") -> Tuple[bool, str, Dict[str, str]]:
+        if not msg_id:
+            msg_id = uuid.uuid4().hex
         remote_command = (
             f"bash {self.remote_script} -n "
             f"{shlex.quote(name)} {shlex.quote(msg_id)} {shlex.quote(text)}"
@@ -700,70 +701,18 @@ class ChatTransport:
         return False, self.last_error, dict(self.status)
 
     # ---- Codex / ChatGPT methods ----
+    # All codex commands go through send_message with __codex__ user name.
+    # Responses come back through read_messages as __codex_resp__ messages.
 
-    def _codex_script(self) -> str:
-        """Return the remote path to codex.sh next to the chat script."""
-        base = self.remote_script.rsplit("/", 1)[0] if "/" in self.remote_script else "."
-        return f"{base}/codex.sh"
+    def codex_send_command(self, args: str) -> Tuple[bool, str, str]:
+        """Send a codex command via the same transport as chat messages.
 
-    def _codex_run(self, args: str, timeout: int = REMOTE_COMMAND_TIMEOUT) -> Tuple[bool, str]:
-        """Run a codex.sh command on the remote server."""
-        remote_command = f"bash {self._codex_script()} {args}"
-        if self.mode == "ssh":
-            try:
-                proc = self._remote_run(remote_command, timeout=timeout)
-            except Exception as exc:
-                return False, str(exc)
-            if proc.returncode == 0:
-                self._mark_success("ssh")
-                return True, proc.stdout
-            self._mark_failure("ssh", proc.stderr.strip() or "codex command failed")
-            return False, proc.stderr.strip() or proc.stdout.strip() or "codex command failed"
+        The server-side chat.sh routes __codex__ messages to codex.sh
+        and stores the result as a __codex_resp__ message with the same msg_id.
 
-        # DNS mode — race all links in parallel (like read_messages)
-        current_links = list(zip(self.dns_ips, self.proxy_ports))
-        if not current_links:
-            return False, "no DNS links configured"
-        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
-        futures = [
-            executor.submit(self._run_link_command, ip, port, remote_command, timeout)
-            for ip, port in current_links
-        ]
-        errors = []
-        for future in as_completed(futures):
-            ip, state, output, error = future.result()
-            if state == "ok":
-                self._mark_success(ip)
-                executor.shutdown(wait=False, cancel_futures=True)
-                return True, output
-            self._mark_failure(ip, error)
-            if error:
-                errors.append(f"{ip}: {error}")
-        return False, "; ".join(errors) if errors else "no working link"
-
-    def codex_check_login(self) -> Tuple[bool, str]:
-        """Check if Codex CLI is logged in. Returns (ok, output)."""
-        return self._codex_run("-l", timeout=20)
-
-    def codex_list_sessions(self) -> Tuple[bool, str]:
-        """List recent Codex sessions. Returns (ok, output)."""
-        return self._codex_run("-s")
-
-    def codex_send_prompt(self, prompt: str, session_id: str = "") -> Tuple[bool, str]:
-        """Send a prompt to Codex. Returns (ok, output)."""
-        args = f"-p {shlex.quote(prompt)}"
-        if session_id:
-            args += f" {shlex.quote(session_id)}"
-        return self._codex_run(args)
-
-    def codex_check_status(self) -> Tuple[bool, str]:
-        """Check status of current Codex prompt. Returns (ok, output)."""
-        return self._codex_run("-c")
-
-    def codex_clear_session(self, session_id: str = "") -> Tuple[bool, str]:
-        """Clear a Codex session. Returns (ok, output)."""
-        args = "-x"
-        if session_id:
-            args += f" {shlex.quote(session_id)}"
-        return self._codex_run(args)
+        Returns (ok, error, msg_id).
+        """
+        msg_id = uuid.uuid4().hex
+        ok, error, _statuses = self.send_message("__codex__", args, msg_id=msg_id)
+        return ok, error, msg_id
 

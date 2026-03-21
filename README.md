@@ -180,14 +180,14 @@ The TUI includes a **ChatGPT** tab that lets you interact with OpenAI's Codex CL
 
 ### How it works
 
-A companion script [`codex.sh`](codex.sh) lives on the server alongside `chat.sh`. It wraps the Codex CLI to provide session management, prompt submission, and response polling over the same `bash … <script>` pattern the chat uses. The client calls `codex.sh` with flags (`-l` login check, `-s` list sessions, `-p` send prompt, `-c` check status, `-x` clear session) through the transport layer.
+A companion script [`codex.sh`](codex.sh) lives on the server alongside `chat.sh`. It wraps the Codex CLI to provide session management, prompt submission, and response polling. Codex commands use the **exact same `send_message` / `read_messages` transport** as regular chat — the client sends a message with user `__codex__` containing the codex arguments, `chat.sh` routes it to `codex.sh`, and the output is stored as a `__codex_resp__` message that the client picks up through the normal `read_messages` poll loop. No separate link racing or DNS fan-out code is needed.
 
 ### Features
 
 - **Login check** — verify the remote Codex / OpenAI authentication is working.
 - **Session management** — list, create, switch between, and clear ChatGPT sessions stored on the server.
 - **Prompt & poll** — send a prompt to ChatGPT via Codex CLI and automatically poll for the response; results appear in the TUI chat area.
-- **Same transport, same resilience** — Codex commands use the same parallel fan-out across all configured DNS links and first-success-wins logic as regular chat messaging, so they benefit from the same DPI resistance and link redundancy.
+- **Same transport, same resilience** — Codex commands travel through `send_message` / `read_messages` — the exact same code path as regular chat. If chat works, codex works.
 
 ---
 
