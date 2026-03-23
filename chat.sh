@@ -23,6 +23,8 @@ notify_telegram() {
 
     [[ "$name" == tg/* ]] && return 0
     [[ "$name" == news/* ]] && return 0
+    [[ "$name" == __codex__* ]] && return 0
+    [[ "$name" == __codex_resp__* ]] && return 0
 
     if [ -f "$BASE_DIR/tg_notify.py" ]; then
         (
