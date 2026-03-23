@@ -119,7 +119,7 @@ cmd_send_prompt() {
 
         if [ -n "$session_id" ]; then
             # Resume existing session
-            codex resume "$session_id" --quiet exec "$prompt" > "$output_file" 2>&1 || true
+            codex resume "$session_id" "$prompt" > "$output_file" 2>&1 || true
         else
             codex exec "$prompt" > "$output_file" 2>&1 || true
         fi

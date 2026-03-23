@@ -370,25 +370,25 @@ class ChatTransport:
         remote_command = f"bash {self.remote_script} -r {limit}"
         # Snapshot current links to avoid races with remove_dns_link.
         current_links = list(zip(self.dns_ips, self.proxy_ports))
-        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
-        futures = [
-            executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-            for ip, port in current_links
-        ]
-        for future in as_completed(futures):
-            ip, state, output, error = future.result()
-            if state == "ok":
-                self._mark_success(ip)
-                if first_output is None:
-                    first_output = output
-                # Got a successful read — cancel remaining futures and return early.
-                executor.shutdown(wait=False, cancel_futures=True)
-                live = set(self.dns_ips)
-                return first_output, {k: v for k, v in self.status.items() if k in live}
-            else:
-                self._mark_failure(ip, error)
-            if error and state == "fail":
-                self.last_error = f"{ip}: {error}"
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(current_links)))) as executor:
+            futures = [
+                executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
+                for ip, port in current_links
+            ]
+            for future in as_completed(futures):
+                ip, state, output, error = future.result()
+                if state == "ok":
+                    self._mark_success(ip)
+                    if first_output is None:
+                        first_output = output
+                    # Got a successful read — cancel remaining futures and return early.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    live = set(self.dns_ips)
+                    return first_output, {k: v for k, v in self.status.items() if k in live}
+                else:
+                    self._mark_failure(ip, error)
+                if error and state == "fail":
+                    self.last_error = f"{ip}: {error}"
         # All failed — return no output.
         live = set(self.dns_ips)
         return first_output, {k: v for k, v in self.status.items() if k in live}
@@ -428,12 +428,11 @@ class ChatTransport:
         successes = 0
         errors = []
         current_links = list(zip(self.dns_ips, self.proxy_ports))
-        executor = ThreadPoolExecutor(max_workers=max(1, len(current_links)))
-        futures = [
-            executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
-            for ip, port in current_links
-        ]
-        try:
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(current_links)))) as executor:
+            futures = [
+                executor.submit(self._run_link_command, ip, port, remote_command, REMOTE_COMMAND_TIMEOUT)
+                for ip, port in current_links
+            ]
             for future in as_completed(futures):
                 ip, state, _output, error = future.result()
                 if state == "ok":
@@ -445,8 +444,6 @@ class ChatTransport:
                 self._mark_failure(ip, error)
                 if state == "fail":
                     errors.append(f"{ip}: {error or 'send failed'}")
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
         if errors:
             self.last_error = "; ".join(errors)
         live = set(self.dns_ips)
